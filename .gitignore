@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Environments and secrets
+.pixi/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Builds
+build/
+dist/
+*.whl
+sbom.json
+
+# Application and test artifacts
+outputs/
+pytest_tmp_*/
+*.sqlite
+*.sqlite-journal
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
