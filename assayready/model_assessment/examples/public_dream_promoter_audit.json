@@ -1,0 +1,65 @@
+{
+  "project": "public_dream_promoter_audit",
+  "assay_files": [
+    "public_dream_promoter_predictions.csv"
+  ],
+  "candidate_files": [
+    "public_dream_promoter_candidates.csv"
+  ],
+  "output_dir": "outputs/assayready/public_dream_promoter_audit",
+  "task": {
+    "type": "regression",
+    "sequence_col": "sequence",
+    "target_col": "measured_activity",
+    "prediction_col": "model_prediction",
+    "uncertainty_col": "model_uncertainty",
+    "id_col": "sequence_id"
+  },
+  "metadata": {
+    "categorical_cols": [
+      "source_split"
+    ]
+  },
+  "split": {
+    "val_fraction": 0.15,
+    "test_fraction": 0.15,
+    "homology_threshold": 0.9,
+    "homology_k": 8,
+    "seed": 13
+  },
+  "ingestion": {
+    "low_n_threshold": 200
+  },
+  "acquisition": {
+    "beta": 1.0,
+    "top_k": 96,
+    "diversity_penalty": 0.2
+  },
+  "evaluation": {
+    "schema_version": 1,
+    "semantics": {
+      "objective_direction": "maximize",
+      "units": "normalized activity",
+      "uncertainty_type": "predictive_standard_deviation"
+    },
+    "constraints_verified": false,
+    "biological_constraints": [
+      "GC fraction should remain in assay-supported range",
+      "avoid long homopolymers that degrade synthesis reliability"
+    ],
+    "provenance": {
+      "model_identifier": "public_dream_demo_baseline",
+      "training_independence": "unverified",
+      "data_identifier": "public_dream_promoter_predictions.csv",
+      "split_identifier": "homology_group_split_v1",
+      "code_revision": "public_example_v1",
+      "duration_seconds": 0,
+      "artifact_verification": "local_checksum_not_provided",
+      "dependency_versions": {
+        "numpy": "2.x",
+        "pandas": "3.x",
+        "scikit-learn": "1.x"
+      }
+    }
+  }
+}
