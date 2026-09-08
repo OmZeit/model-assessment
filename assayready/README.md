@@ -6,6 +6,10 @@ AssayReady is a local, privacy-first computational biology workstation and audit
 
 The core question behind AssayReady: **is a prediction table credible enough to guide the next experiment?** AssayReady 2.0 answers this with traceable evidence chains, locked-holdout validation, and reproducible run artifacts.
 
+<p align="center">
+  <img src="docs/assets/assayready_demo.gif" alt="AssayReady 2.0 Precision Bio-Instrument Console Walkthrough" width="100%" />
+</p>
+
 ---
 
 ## What's New in V2
@@ -151,6 +155,53 @@ Open `http://127.0.0.1:8050` in your browser to access the 3-column workstation:
   - Live engine status (`PyTorch • Pixi • SQLite • Leakage-Aware`).
   - Expected column schema reference and active assurance check indicators.
   - Contextual live evidence metrics generated during analysis.
+
+### Interface Gallery
+
+<details open>
+<summary><b>1. Bio-Sequence Assurance Console & Evidence Package</b></summary>
+<br>
+
+![AssayReady Bio-Sequence Assurance Console](docs/assets/console_overview.png)
+
+*The Analyze workflow with automated 4-step stepper, live dataset integrity checking, baseline evaluation, and real-time assurance gate verdicts.*
+</details>
+
+<details open>
+<summary><b>2. Design Sandbox & Generative Sequence Studio</b></summary>
+<br>
+
+![AssayReady Design Sandbox](docs/assets/design_sandbox.png)
+
+*Mask-fill, random mutagenesis, and diversity sampling generation with strict GC-content boundaries, homopolymer limits, and automated Golden Gate cloning enzyme avoidance (BsaI/BsmBI).*
+</details>
+
+<details open>
+<summary><b>3. Candidate Explorer & Synthesis Risk Tags</b></summary>
+<br>
+
+![AssayReady Candidate Explorer](docs/assets/candidate_explorer.png)
+
+*Ranked sequences with model predictions, uncertainty bounds, reference similarity distances, and contextual synthesis risk flags for wet-lab review.*
+</details>
+
+<details>
+<summary><b>4. Benchmark Library & Reference Baselines</b></summary>
+<br>
+
+![AssayReady Benchmark Library](docs/assets/benchmarks_library.png)
+
+*Pre-indexed public benchmarks (including DREAM 2022 and GSE135464 promoter runs) with transparent evidence classifications and fitted sequence baselines.*
+</details>
+
+<details>
+<summary><b>5. Retrospective Audit & Evidence Package</b></summary>
+<br>
+
+![AssayReady Evidence Report](docs/assets/evidence_report.png)
+
+*Downloadable audit zip packages, baseline model comparisons, uncertainty diagnostics, and policy gate verdicts.*
+</details>
 
 ---
 
