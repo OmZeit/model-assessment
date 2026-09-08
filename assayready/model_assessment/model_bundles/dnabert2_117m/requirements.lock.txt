@@ -1,4 +1,4 @@
-transformers==4.38.2
+transformers==5.10.1
 huggingface-hub==0.23.5
 tokenizers==0.15.2
 safetensors==0.4.3
