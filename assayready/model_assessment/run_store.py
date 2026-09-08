@@ -12,14 +12,25 @@ from typing import Any
 
 
 RUN_DB_ENV = "ASSAYREADY_RUN_DB"
+OUTPUT_ROOT_ENV = "ASSAYREADY_OUTPUT_ROOT"
 WINDOWS_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+
+
+def default_output_root() -> Path:
+    configured = os.environ.get(OUTPUT_ROOT_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    repository_root = Path(__file__).resolve().parents[2]
+    if (repository_root / "pyproject.toml").is_file():
+        return (repository_root / "outputs" / "assayready").resolve()
+    return (Path.home() / ".assayready" / "outputs").resolve()
 
 
 def default_db_path() -> Path:
     configured = os.environ.get(RUN_DB_ENV)
     if configured:
         return Path(configured).expanduser()
-    return Path("outputs") / "assayready" / "assayready_runs.sqlite"
+    return default_output_root() / "assayready_runs.sqlite"
 
 
 def _now() -> str:
@@ -489,8 +500,8 @@ def list_artifacts(run_id: str, *, db_path: str | Path | None = None) -> list[di
     return out
 
 
-def index_existing_runs(root: str | Path = Path("outputs") / "assayready", *, db_path: str | Path | None = None) -> int:
-    root_path = Path(root)
+def index_existing_runs(root: str | Path | None = None, *, db_path: str | Path | None = None) -> int:
+    root_path = Path(root) if root is not None else default_output_root()
     if not root_path.exists():
         return 0
     count = 0

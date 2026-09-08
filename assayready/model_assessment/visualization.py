@@ -17,16 +17,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-INK = "#192124"
-MUTED = "#617174"
-ACCENT = "#0f766e"
+INK = "#e8eef5"
+MUTED = "#a8b3c2"
+ACCENT = "#5ac8ad"
 ACCENT_LIGHT = "#5eead4"
-INDIGO = "#4f46e5"
-SKY = "#0284c7"
-DANGER = "#b91c1c"
-WARN = "#ea580c"
-GRID = "#e7efed"
-PALETTE = [ACCENT, INDIGO, SKY, WARN, "#7c3aed", "#db2777"]
+INDIGO = "#818cf8"
+SKY = "#38bdf8"
+DANGER = "#fb7185"
+WARN = "#fb923c"
+GRID = "#2b3542"
+PALETTE = [ACCENT, INDIGO, SKY, WARN, "#a78bfa", "#f472b6"]
 
 
 def _finite(value: Any) -> float | None:
@@ -148,9 +148,9 @@ def _style_figure(
 ) -> go.Figure:
     figure.update_layout(
         title={"text": title, "font": {"size": 18, "color": INK}, "x": 0.02, "xanchor": "left"},
-        template="plotly_white",
+        template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="white",
+        plot_bgcolor="#141922",
         font={"family": "Inter, ui-sans-serif, system-ui, sans-serif", "color": INK, "size": 13},
         colorway=PALETTE,
         height=height,
@@ -163,7 +163,7 @@ def _style_figure(
         "automargin": True,
         "gridcolor": GRID,
         "gridwidth": 1,
-        "zerolinecolor": "#cbd9d5",
+        "zerolinecolor": "#526071",
         "showline": False,
         "ticks": "outside",
         "ticklen": 4,
@@ -192,7 +192,17 @@ def benchmark_metric_figure(report: dict[str, Any]) -> go.Figure:
     """
     model_metrics = report.get("test_metrics") or report.get("task_head_metrics") or {}
     model_value = _finite(model_metrics.get("primary_metric", report.get("task_head_primary_metric")))
-    metric_name = str(report.get("primary_metric_name") or model_metrics.get("primary_metric_name") or "primary metric")
+    raw_metric_name = str(report.get("primary_metric_name") or model_metrics.get("primary_metric_name") or "primary metric")
+    metric_name = {
+        "r2": "Held-out R-squared (higher is better)",
+        "r_squared": "Held-out R-squared (higher is better)",
+        "mae": "Held-out MAE (lower is better)",
+        "rmse": "Held-out RMSE (lower is better)",
+        "auroc": "Held-out AUROC (higher is better)",
+        "average_precision": "Held-out average precision (higher is better)",
+        "balanced_accuracy": "Held-out balanced accuracy (higher is better)",
+        "spearman": "Held-out Spearman correlation (higher is better)",
+    }.get(raw_metric_name.lower(), raw_metric_name.replace("_", " ").title())
     names: list[str] = []
     values: list[float] = []
     colors: list[str] = []
@@ -210,15 +220,12 @@ def benchmark_metric_figure(report: dict[str, Any]) -> go.Figure:
         "kmer4_linear_probe": "Linear probe using 4-mer frequency features",
     }
     best_baseline_name = str((report.get("best_simple_baseline") or {}).get("name") or "")
-    baseline_colors = [SKY, "#7c3aed", "#64748b", "#db2777"]
-    baseline_index = 0
     for name, metrics in (report.get("baselines") or {}).items():
         value = _finite((metrics or {}).get("primary_metric"))
         if value is not None:
             names.append(str(name).replace("_", " "))
             values.append(value)
-            colors.append(INDIGO if str(name) == best_baseline_name else baseline_colors[baseline_index % len(baseline_colors)])
-            baseline_index += 1
+            colors.append("#94a3b8" if str(name) == best_baseline_name else "#cbd5e1")
             descriptions.append(baseline_descriptions.get(str(name), "Fitted sequence baseline evaluated on the same held-out split"))
     if not values:
         return empty_figure("Model vs fitted baselines", "No comparable primary metrics were persisted for this run.")
@@ -357,15 +364,17 @@ def residual_figure(
     figure.add_trace(
         go.Histogram(
             y=histogram_data["_residual"],
-            marker={"color": INDIGO if selected else SKY},
-            opacity=0.78,
+            nbinsy=max(6, min(20, int(len(histogram_data) ** 0.5 * 2))),
+            marker={"color": INDIGO if selected else SKY, "line": {"color": "white", "width": 1}},
+            opacity=0.82,
             hovertemplate="Residual %{y:.5g}<br>Count %{x}<extra></extra>",
             showlegend=False,
         ),
         row=1,
         col=2,
     )
-    _style_figure(figure, title="Residual diagnostics (prediction − measured)", x_title=None, y_title=None)
+    _style_figure(figure, title="Residual diagnostics (prediction - measured)", x_title=None, y_title=None)
+    figure.update_layout(bargap=0.12)
     figure.update_xaxes(title_text="Prediction", row=1, col=1)
     figure.update_yaxes(title_text="Residual", row=1, col=1)
     figure.update_xaxes(title_text="Count", row=1, col=2)
@@ -408,6 +417,86 @@ def classification_discrimination_figure(
     figure.update_yaxes(title_text="True-positive rate", range=[0, 1], row=1, col=1)
     figure.update_xaxes(title_text="Recall", range=[0, 1], row=1, col=2)
     figure.update_yaxes(title_text="Precision", range=[0, 1], row=1, col=2)
+    return figure
+
+
+def ranking_diagnostics_figure(
+    frame: pd.DataFrame,
+    *,
+    target_col: str,
+    prediction_col: str,
+    objective_direction: str = "maximize",
+) -> go.Figure:
+    """Rank agreement and top-k recovery for persisted held-out observations."""
+    data = frame.copy()
+    data["_target"] = pd.to_numeric(data.get(target_col), errors="coerce")
+    data["_prediction"] = pd.to_numeric(data.get(prediction_col), errors="coerce")
+    data = data.dropna(subset=["_target", "_prediction"]).reset_index(drop=True)
+    if len(data) < 2:
+        return empty_figure("Held-out ranking diagnostics", "At least two comparable held-out rows are required.")
+
+    ascending = str(objective_direction).strip().lower() == "minimize"
+    data["_measured_rank"] = data["_target"].rank(method="average", ascending=ascending)
+    data["_predicted_rank"] = data["_prediction"].rank(method="average", ascending=ascending)
+    n_rows = len(data)
+    predicted_order = data.sort_values("_prediction", ascending=ascending, kind="stable").index.to_list()
+    measured_order = data.sort_values("_target", ascending=ascending, kind="stable").index.to_list()
+    predicted_top: set[int] = set()
+    measured_top: set[int] = set()
+    overlap: list[float] = []
+    for index in range(n_rows):
+        predicted_top.add(int(predicted_order[index]))
+        measured_top.add(int(measured_order[index]))
+        overlap.append(len(predicted_top & measured_top) / float(index + 1))
+
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("Measured rank vs predicted rank", "Top-k set recovery"),
+        horizontal_spacing=0.12,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=data["_measured_rank"],
+            y=data["_predicted_rank"],
+            mode="markers",
+            marker={"color": ACCENT, "size": 8, "opacity": 0.72, "line": {"color": "white", "width": 0.7}},
+            customdata=np.stack([data["_target"], data["_prediction"]], axis=1),
+            hovertemplate="Measured rank %{x:.3g}<br>Predicted rank %{y:.3g}<br>Measured %{customdata[0]:.5g}<br>Predicted %{customdata[1]:.5g}<extra></extra>",
+            name="Held-out rows",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=[1, n_rows],
+            y=[1, n_rows],
+            mode="lines",
+            line={"color": MUTED, "dash": "dash"},
+            hoverinfo="skip",
+            name="Perfect agreement",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=list(range(1, n_rows + 1)),
+            y=overlap,
+            mode="lines",
+            line={"color": INDIGO, "width": 3},
+            hovertemplate="k=%{x}<br>Shared top-k fraction %{y:.1%}<extra></extra>",
+            name="Shared top-k fraction",
+        ),
+        row=1,
+        col=2,
+    )
+    _style_figure(figure, title=f"Held-out ranking diagnostics (n={n_rows})", height=390)
+    figure.update_xaxes(title_text="Measured rank (1 = best)", autorange="reversed", row=1, col=1)
+    figure.update_yaxes(title_text="Predicted rank (1 = best)", autorange="reversed", row=1, col=1)
+    figure.update_xaxes(title_text="Top k", row=1, col=2)
+    figure.update_yaxes(title_text="Shared fraction", range=[0, 1.02], tickformat=".0%", row=1, col=2)
     return figure
 
 
@@ -528,14 +617,25 @@ def regression_slice_summary(
     return pd.DataFrame(rows).sort_values(["mae", "n"], ascending=[False, True]).reset_index(drop=True)
 
 
-def simulation_landscape_figure(frame: pd.DataFrame) -> go.Figure:
+def simulation_landscape_figure(
+    frame: pd.DataFrame,
+    *,
+    model_backed: bool = False,
+    target_label: str | None = None,
+    selected_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> go.Figure:
     prediction_col = "predicted_activity" if "predicted_activity" in frame else "assay_prediction"
     uncertainty_col = "model_uncertainty" if "model_uncertainty" in frame else "assay_uncertainty"
+    title = "Model prediction and uncertainty" if model_backed else "Heuristic candidate landscape"
     if prediction_col not in frame or uncertainty_col not in frame:
-        return empty_figure("Heuristic candidate landscape", "Candidate prediction and uncertainty columns are unavailable.")
+        return empty_figure(title, "Candidate prediction and uncertainty columns are unavailable.")
     figure = go.Figure()
+    selected = {str(value) for value in (selected_ids or [])}
     passes = frame.get("passes_basic_filters", pd.Series([True] * len(frame), index=frame.index)).astype(bool)
-    for passed, label, color in [(True, "Passes simple filters", ACCENT), (False, "Fails simple filters", DANGER)]:
+    for passed, label, color, symbol in [
+        (True, "✓ Eligible", ACCENT, "circle"),
+        (False, "× Excluded", DANGER, "x"),
+    ]:
         subset = frame[passes == passed]
         if subset.empty:
             continue
@@ -545,6 +645,10 @@ def simulation_landscape_figure(frame: pd.DataFrame) -> go.Figure:
         custom[:, 0] = subset.get("design_id", subset.index).astype(str)
         custom[:, 1] = pd.to_numeric(subset.get("gc_fraction"), errors="coerce")
         custom[:, 2] = pd.to_numeric(subset.get("acquisition_score"), errors="coerce")
+        prediction_name = _label(target_label, fallback="Model prediction") if model_backed else "Heuristic activity"
+        uncertainty_name = "Ensemble disagreement (SD)" if model_backed else "Heuristic uncertainty"
+        design_ids = subset.get("design_id", subset.index).astype(str).tolist()
+        selected_points = [index for index, design_id in enumerate(design_ids) if design_id in selected]
         figure.add_trace(
             go.Scatter(
                 x=subset[prediction_col],
@@ -552,43 +656,177 @@ def simulation_landscape_figure(frame: pd.DataFrame) -> go.Figure:
                 mode="markers",
                 name=label,
                 customdata=custom,
-                marker={"color": color, "size": sizes, "opacity": 0.72, "line": {"color": "white", "width": 0.7}},
-                hovertemplate="%{customdata[0]}<br>Heuristic activity %{x:.4g}<br>Heuristic uncertainty %{y:.4g}<br>GC %{customdata[1]:.1%}<br>Acquisition %{customdata[2]:.4g}<extra></extra>",
+                marker={"color": color, "symbol": symbol, "size": sizes, "opacity": 0.78, "line": {"color": "#0d1117", "width": 0.8}},
+                selectedpoints=selected_points if selected else None,
+                selected={"marker": {"opacity": 1.0, "size": 18}},
+                unselected={"marker": {"opacity": 0.24}} if selected else None,
+                hovertemplate=f"%{{customdata[0]}}<br>{prediction_name} %{{x:.4g}}<br>{uncertainty_name} %{{y:.4g}}<br>GC %{{customdata[1]:.1%}}<br>Acquisition %{{customdata[2]:.4g}}<extra></extra>",
             )
         )
-    return _style_figure(figure, title="Heuristic candidate landscape", x_title="Simulated activity proxy", y_title="Simulated uncertainty proxy")
+    x_title = _label(target_label, fallback="Predicted assay activity") if model_backed else "Simulated activity proxy"
+    y_title = "Ensemble disagreement (SD)" if model_backed else "Simulated uncertainty proxy"
+    _style_figure(figure, title=title, x_title=x_title, y_title=y_title)
+    figure.update_layout(
+        uirevision="simulation-landscape",
+        selectionrevision="simulation-candidate-selection",
+        clickmode="event+select",
+        dragmode="lasso",
+    )
+    return figure
+
+
+def simulation_generation_figure(frame: pd.DataFrame, *, parent_sequence: str, mode: str) -> go.Figure:
+    """Describe what the selected generator actually changed, without inferring biology."""
+    if "sequence" not in frame or frame.empty:
+        return empty_figure("Generation diagnostics", "No generated sequences are available.")
+    parent = "".join(str(parent_sequence or "").upper().replace("[MASK]", "N").split())
+    sequences = ["".join(str(value).upper().split()) for value in frame["sequence"]]
+    comparable = [sequence for sequence in sequences if len(sequence) == len(parent)]
+    if not parent or not comparable:
+        return empty_figure("Generation diagnostics", "Generated sequences are not length-compatible with the parent.")
+
+    if mode == "Mask-fill":
+        masked = [index for index, base in enumerate(parent) if base == "N"]
+        if not masked:
+            return empty_figure("Masked-position composition", "The parent contains no N or [MASK] positions.")
+        figure = go.Figure()
+        for base, color in [("A", ACCENT), ("C", SKY), ("G", INDIGO), ("T", WARN)]:
+            fractions = [sum(sequence[index] == base for sequence in comparable) / len(comparable) for index in masked]
+            figure.add_trace(
+                go.Bar(
+                    x=[index + 1 for index in masked],
+                    y=fractions,
+                    name=base,
+                    marker={"color": color},
+                    hovertemplate=f"Position %{{x}}<br>{base} %{{y:.1%}}<extra></extra>",
+                )
+            )
+        _style_figure(
+            figure,
+            title=f"Masked-position nucleotide composition (n={len(comparable)})",
+            x_title="1-based parent position",
+            y_title="Generated fraction",
+            height=370,
+        )
+        figure.update_layout(barmode="stack", uirevision="simulation-mask-composition")
+        figure.update_yaxes(range=[0, 1], tickformat=".0%")
+        return figure
+
+    mutation_counts = [sum(parent[index] != sequence[index] for index in range(len(parent)) if parent[index] != "N") for sequence in comparable]
+    position_rates = [
+        sum(sequence[index] != parent[index] for sequence in comparable) / len(comparable)
+        for index in range(len(parent))
+        if parent[index] != "N"
+    ]
+    positions = [index + 1 for index, base in enumerate(parent) if base != "N"]
+    if mode == "Diversity sampling":
+        sample = comparable[:250]
+        nearest_distances: list[float] = []
+        for index, sequence in enumerate(sample):
+            distances = [
+                sum(left != right for left, right in zip(sequence, other, strict=True)) / len(parent)
+                for other_index, other in enumerate(sample)
+                if other_index != index
+            ]
+            if distances:
+                nearest_distances.append(min(distances))
+        parent_distances = [sum(left != right for left, right in zip(sequence, parent, strict=True)) / len(parent) for sequence in sample]
+        figure = make_subplots(rows=1, cols=2, subplot_titles=("Distance from parent", "Nearest-neighbor distance"), horizontal_spacing=0.12)
+        figure.add_trace(go.Histogram(x=parent_distances, marker={"color": ACCENT}, opacity=0.82, showlegend=False), row=1, col=1)
+        figure.add_trace(go.Histogram(x=nearest_distances, marker={"color": INDIGO}, opacity=0.82, showlegend=False), row=1, col=2)
+        _style_figure(figure, title=f"Observed sequence spread (sample n={len(sample)})", height=370)
+        figure.update_xaxes(title_text="Normalized Hamming distance", row=1, col=1)
+        figure.update_yaxes(title_text="Candidates", row=1, col=1)
+        figure.update_xaxes(title_text="Normalized Hamming distance", row=1, col=2)
+        figure.update_yaxes(title_text="Candidates", row=1, col=2)
+        figure.update_layout(uirevision="simulation-diversity-diagnostics")
+        return figure
+
+    figure = make_subplots(rows=1, cols=2, subplot_titles=("Mutations per candidate", "Mutation frequency by position"), horizontal_spacing=0.12)
+    figure.add_trace(go.Histogram(x=mutation_counts, marker={"color": INDIGO}, opacity=0.82, showlegend=False), row=1, col=1)
+    figure.add_trace(go.Bar(x=positions, y=position_rates, marker={"color": ACCENT}, showlegend=False), row=1, col=2)
+    _style_figure(figure, title=f"Random-mutagenesis profile (n={len(comparable)})", height=370)
+    figure.update_xaxes(title_text="Changed unmasked bases", row=1, col=1)
+    figure.update_yaxes(title_text="Candidates", row=1, col=1)
+    figure.update_xaxes(title_text="1-based parent position", row=1, col=2)
+    figure.update_yaxes(title_text="Changed fraction", range=[0, 1], tickformat=".0%", row=1, col=2)
+    figure.update_layout(uirevision="simulation-mutation-profile")
+    return figure
 
 
 def simulation_constraints_figure(frame: pd.DataFrame, *, gc_low: float, gc_high: float, max_homopolymer: int) -> go.Figure:
-    figure = make_subplots(rows=1, cols=2, subplot_titles=("GC fraction", "Maximum homopolymer"), horizontal_spacing=0.12)
+    figure = make_subplots(rows=1, cols=2, subplot_titles=("GC fraction", "Maximum homopolymer"), horizontal_spacing=0.18)
     if "gc_fraction" in frame:
-        figure.add_trace(go.Histogram(x=frame["gc_fraction"], marker={"color": ACCENT}, opacity=0.82, showlegend=False), row=1, col=1)
+        figure.add_trace(
+            go.Histogram(
+                x=frame["gc_fraction"],
+                marker={"color": ACCENT},
+                opacity=0.82,
+                showlegend=False,
+                hovertemplate="GC fraction: %{x:.1%}<br>Candidates: %{y}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
         figure.add_vline(x=float(gc_low), line_dash="dash", line_color=WARN, row=1, col=1)
         figure.add_vline(x=float(gc_high), line_dash="dash", line_color=WARN, row=1, col=1)
     if "max_homopolymer" in frame:
-        figure.add_trace(go.Histogram(x=frame["max_homopolymer"], marker={"color": "#80aaa2"}, opacity=0.82, showlegend=False), row=1, col=2)
+        homopolymer = pd.to_numeric(frame["max_homopolymer"], errors="coerce").dropna()
+        figure.add_trace(
+            go.Histogram(
+                x=homopolymer,
+                xbins={"start": 0.5, "end": max(1.5, float(homopolymer.max()) + 0.5) if not homopolymer.empty else 1.5, "size": 1},
+                marker={"color": "#80aaa2"},
+                opacity=0.82,
+                showlegend=False,
+                hovertemplate="Longest run: %{x:.0f} nt<br>Candidates: %{y}<extra></extra>",
+            ),
+            row=1,
+            col=2,
+        )
         figure.add_vline(x=float(max_homopolymer), line_dash="dash", line_color=WARN, row=1, col=2)
     _style_figure(figure, title="Sequence constraint distributions", height=360)
-    figure.update_xaxes(title_text="GC fraction", row=1, col=1)
+    figure.update_layout(margin={"l": 68, "r": 36, "t": 68, "b": 62}, bargap=0.12)
+    figure.update_xaxes(title_text="GC fraction", tickformat=".0%", nticks=7, row=1, col=1)
     figure.update_yaxes(title_text="Candidates", row=1, col=1)
-    figure.update_xaxes(title_text="Longest run (nt)", row=1, col=2)
+    figure.update_xaxes(title_text="Longest run (nt)", dtick=1, tickformat="d", row=1, col=2)
     figure.update_yaxes(title_text="Candidates", row=1, col=2)
     return figure
 
 
-def plate_layout_figure(plate_plan: pd.DataFrame) -> go.Figure:
+def plate_layout_figure(plate_plan: pd.DataFrame, *, plate_size: int | None = None) -> go.Figure:
     required = {"plate_row", "plate_column", "role"}
     if plate_plan.empty or not required.issubset(plate_plan.columns):
-        return empty_figure("Draft plate layout", "No plate plan was generated.")
+        return empty_figure("Draft well layout", "No unapproved well-layout preview was generated.")
     data = plate_plan.copy()
     data["plate_column"] = pd.to_numeric(data["plate_column"], errors="coerce")
     data = data.dropna(subset=["plate_column"])
-    rows = sorted(data["plate_row"].astype(str).unique())
-    cols = sorted(data["plate_column"].astype(int).unique())
-    roles = list(dict.fromkeys(data["role"].astype(str)))
+    layout_shapes = {24: (list("ABCD"), list(range(1, 7))), 48: (list("ABCDEF"), list(range(1, 9))), 96: (list("ABCDEFGH"), list(range(1, 13))), 384: (list("ABCDEFGHIJKLMNOP"), list(range(1, 25)))}
+    if plate_size in layout_shapes:
+        rows, cols = layout_shapes[int(plate_size)]
+    else:
+        observed_rows = sorted(data["plate_row"].astype(str).unique())
+        observed_cols = sorted(data["plate_column"].astype(int).unique())
+        inferred = 24 if len(observed_rows) <= 4 and max(observed_cols) <= 6 else 96 if len(observed_rows) <= 8 and max(observed_cols) <= 12 else 384
+        rows, cols = layout_shapes[inferred]
+    role_order = [
+        "empty",
+        "prioritized_candidate",
+        "exploit_top_prediction",
+        "explore_high_uncertainty",
+        "diversity_representative",
+        "backup_ranked_candidate",
+        "positive_control",
+        "negative_control",
+        "blank_control",
+        "process_control",
+    ]
+    observed_roles = set(data["role"].astype(str))
+    roles = [role for role in role_order if role == "empty" or role in observed_roles]
+    roles.extend(sorted(observed_roles - set(roles)))
     role_values = {role: index for index, role in enumerate(roles)}
-    z = np.full((len(rows), len(cols)), np.nan)
-    hover = np.full((len(rows), len(cols)), "Empty", dtype=object)
+    z = np.full((len(rows), len(cols)), role_values["empty"], dtype=float)
+    hover = np.asarray([[f"{row}{col}<br>Empty" for col in cols] for row in rows], dtype=object)
     row_index = {value: index for index, value in enumerate(rows)}
     col_index = {value: index for index, value in enumerate(cols)}
     for _, item in data.iterrows():
@@ -597,13 +835,24 @@ def plate_layout_figure(plate_plan: pd.DataFrame) -> go.Figure:
         role = str(item["role"])
         z[r, c] = role_values[role]
         hover[r, c] = f"{item.get('well', '')}<br>{role}<br>{item.get('design_id', '')}"
-    palette = [ACCENT, "#2563eb", WARN, "#7c3aed", "#64748b", "#db2777", "#0891b2"]
+    role_colors = {
+        "empty": "#252e38",
+        "prioritized_candidate": ACCENT,
+        "exploit_top_prediction": ACCENT,
+        "explore_high_uncertainty": SKY,
+        "diversity_representative": INDIGO,
+        "backup_ranked_candidate": "#64748b",
+        "positive_control": "#2563eb",
+        "negative_control": "#64748b",
+        "blank_control": "#7c3aed",
+        "process_control": WARN,
+    }
     denom = max(1, len(roles) - 1)
     colorscale: list[list[Any]] = []
     for index, _role in enumerate(roles):
         start = max(0.0, (index - 0.49) / denom)
         end = min(1.0, (index + 0.49) / denom)
-        color = palette[index % len(palette)]
+        color = role_colors.get(_role, "#db2777")
         colorscale.extend([[start, color], [end, color]])
     figure = go.Figure(
         go.Heatmap(
@@ -615,10 +864,12 @@ def plate_layout_figure(plate_plan: pd.DataFrame) -> go.Figure:
             colorscale=colorscale,
             zmin=0,
             zmax=max(1, len(roles) - 1),
-            colorbar={"tickvals": list(range(len(roles))), "ticktext": [role.replace("_", " ") for role in roles], "title": "Role"},
+            colorbar={"tickvals": list(range(len(roles))), "ticktext": [role.replace("_", " ") for role in roles], "title": "Role", "len": 0.86},
             xgap=2,
             ygap=2,
         )
     )
     figure.update_yaxes(autorange="reversed")
-    return _style_figure(figure, title="Draft randomized plate layout", x_title="Column", y_title="Row", height=420)
+    figure.update_xaxes(dtick=1, range=[min(cols) - 0.5, max(cols) + 0.5], side="top")
+    figure.update_yaxes(categoryorder="array", categoryarray=rows)
+    return _style_figure(figure, title=f"Unapproved full {len(rows)} × {len(cols)} well-layout preview", x_title="Column", y_title="Row", height=500)

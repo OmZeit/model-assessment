@@ -94,6 +94,21 @@ def test_remote_debug_combination_blocked() -> None:
         ui.run_server(host="127.0.0.1", port=8050, debug=True, allow_remote=True)
 
 
+def test_ui_request_guard_rejects_cross_origin_and_dns_rebinding_hosts() -> None:
+    assert ui._ui_request_is_allowed(
+        "127.0.0.1:8050", "POST", "http://127.0.0.1:8050", "same-origin"
+    )
+    assert not ui._ui_request_is_allowed(
+        "127.0.0.1:8050", "POST", "https://malicious.example", "cross-site"
+    )
+    assert not ui._ui_request_is_allowed(
+        "malicious.example:8050", "GET", None, None
+    )
+    assert not ui._ui_request_is_allowed(
+        "127.0.0.1:8050", "POST", "https://127.0.0.1:8050", "same-site"
+    )
+
+
 def test_resolve_upload_reference_security(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     config_dir = tmp_path / "config"

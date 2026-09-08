@@ -18,6 +18,18 @@ def test_artifact_dir_preserves_an_existing_run(tmp_path: Path) -> None:
     assert (first / "existing.txt").read_text(encoding="utf-8") == "first run\n"
 
 
+def test_default_artifact_dir_uses_canonical_output_root_not_cwd(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "canonical-output"
+    unrelated_cwd = tmp_path / "unrelated"
+    unrelated_cwd.mkdir()
+    monkeypatch.setenv("ASSAYREADY_OUTPUT_ROOT", str(output_root))
+    monkeypatch.chdir(unrelated_cwd)
+
+    artifact_dir = _artifact_dir("Client Project", None)
+
+    assert artifact_dir.parent == (output_root / "Client-Project").resolve()
+
+
 def test_record_run_uses_execution_identity_and_provenance(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()

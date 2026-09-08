@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Mapping
 
 
@@ -20,6 +21,8 @@ class EvaluationManifest:
     biological_constraints: list[str]
     provenance: dict[str, Any]
     claim_thresholds: dict[str, Any]
+    threshold_policy: dict[str, Any]
+    prospective_protocol: dict[str, Any] | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +37,10 @@ class EvaluationManifest:
             "biological_constraints": list(self.biological_constraints),
             "provenance": dict(self.provenance),
             "claim_thresholds": dict(self.claim_thresholds),
+            "threshold_policy": dict(self.threshold_policy),
+            "prospective_protocol": (
+                dict(self.prospective_protocol) if self.prospective_protocol is not None else None
+            ),
         }
 
 
@@ -78,6 +85,145 @@ def _default_thresholds() -> dict[str, Any]:
         "min_lift_delta": 0.0,
         "min_uncertainty_spearman": 0.20,
         "max_calibration_gap_ratio": 1.0,
+    }
+
+
+def _default_threshold_policy() -> dict[str, Any]:
+    return {
+        "source": "development_default",
+        "policy_name": "assayready_development_defaults_v1",
+        "rationale": (
+            "Generic development defaults for sensitivity analysis; not empirically validated "
+            "as universal biological credibility standards."
+        ),
+        "assay_type": "unspecified",
+        "measurement_noise": "unspecified",
+        "effect_size": "unspecified",
+        "class_imbalance": "unspecified",
+        "decision_consequence": "unspecified",
+    }
+
+
+def _parse_iso_timestamp(value: Any, *, field: str) -> str:
+    text = _as_nonempty_text(value, field=field)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp.") from exc
+    if parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include an explicit UTC offset or Z suffix.")
+    return text
+
+
+def _validate_sha256(value: Any, *, field: str, required: bool = False) -> str:
+    digest = str(value or "").strip().lower()
+    if required and not digest:
+        raise ValueError(f"{field} is required.")
+    if digest and (len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)):
+        raise ValueError(f"{field} must be a 64-character SHA-256 digest.")
+    return digest
+
+
+def _validate_threshold_policy(evaluation: Mapping[str, Any], *, custom_thresholds: bool) -> dict[str, Any]:
+    raw = evaluation.get("threshold_policy")
+    if raw is None:
+        policy = _default_threshold_policy()
+        if custom_thresholds:
+            policy.update(
+                {
+                    "source": "customer_configured",
+                    "policy_name": "customer_configured_thresholds",
+                    "rationale": "Customer-supplied values; empirical assay validation was not documented.",
+                }
+            )
+        return policy
+
+    configured = _as_mapping(raw, field="evaluation.threshold_policy")
+    source = _as_nonempty_text(configured.get("source"), field="evaluation.threshold_policy.source").lower()
+    if source not in {"development_default", "customer_configured", "empirically_validated"}:
+        raise ValueError(
+            "evaluation.threshold_policy.source must be 'development_default', "
+            "'customer_configured', or 'empirically_validated'."
+        )
+    normalized = {
+        "source": source,
+        "policy_name": _as_nonempty_text(
+            configured.get("policy_name"), field="evaluation.threshold_policy.policy_name"
+        ),
+        "rationale": _as_nonempty_text(
+            configured.get("rationale"), field="evaluation.threshold_policy.rationale"
+        ),
+    }
+    for field_name in [
+        "assay_type",
+        "measurement_noise",
+        "effect_size",
+        "class_imbalance",
+        "decision_consequence",
+    ]:
+        normalized[field_name] = _as_nonempty_text(
+            configured.get(field_name, "unspecified"),
+            field=f"evaluation.threshold_policy.{field_name}",
+        )
+    if source == "empirically_validated":
+        unspecified = [
+            name
+            for name in [
+                "assay_type",
+                "measurement_noise",
+                "effect_size",
+                "class_imbalance",
+                "decision_consequence",
+            ]
+            if normalized[name].lower() == "unspecified"
+        ]
+        if unspecified:
+            raise ValueError(
+                "An empirically_validated threshold policy must document: " + ", ".join(unspecified)
+            )
+    return normalized
+
+
+def _validate_prospective_protocol(evaluation: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = evaluation.get("prospective_protocol")
+    if raw is None:
+        return None
+    protocol = _as_mapping(raw, field="evaluation.prospective_protocol")
+    selected_at = _parse_iso_timestamp(
+        protocol.get("candidate_selection_timestamp"),
+        field="evaluation.prospective_protocol.candidate_selection_timestamp",
+    )
+    measured_at = _parse_iso_timestamp(
+        protocol.get("measurement_timestamp"),
+        field="evaluation.prospective_protocol.measurement_timestamp",
+    )
+    selected_time = datetime.fromisoformat(selected_at.replace("Z", "+00:00"))
+    measured_time = datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
+    if selected_time >= measured_time:
+        raise ValueError(
+            "evaluation.prospective_protocol.candidate_selection_timestamp must precede measurement_timestamp."
+        )
+    return {
+        "protocol_identifier": _as_nonempty_text(
+            protocol.get("protocol_identifier"),
+            field="evaluation.prospective_protocol.protocol_identifier",
+        ),
+        "candidate_selection_timestamp": selected_at,
+        "measurement_timestamp": measured_at,
+        "selection_manifest_path": _as_nonempty_text(
+            protocol.get("selection_manifest_path"),
+            field="evaluation.prospective_protocol.selection_manifest_path",
+        ),
+        "selection_manifest_sha256": _validate_sha256(
+            protocol.get("selection_manifest_sha256"),
+            field="evaluation.prospective_protocol.selection_manifest_sha256",
+            required=True,
+        ),
+        "outcome_data_sha256": _validate_sha256(
+            protocol.get("outcome_data_sha256"),
+            field="evaluation.prospective_protocol.outcome_data_sha256",
+            required=True,
+        ),
     }
 
 
@@ -146,14 +292,15 @@ def validate_evaluation_manifest(config: Mapping[str, Any], *, task_type: str) -
             provenance.get("artifact_verification"), field="evaluation.provenance.artifact_verification"
         ),
     }
-    for hash_field in ["training_data_sha256", "model_sha256", "split_sha256"]:
-        value = str(provenance.get(hash_field) or "").strip().lower()
-        if value and (len(value) != 64 or any(character not in "0123456789abcdef" for character in value)):
-            raise ValueError(f"evaluation.provenance.{hash_field} must be a 64-character SHA-256 digest.")
-        normalized_provenance[hash_field] = value
+    for hash_field in ["training_data_sha256", "model_sha256", "split_sha256", "code_sha256"]:
+        normalized_provenance[hash_field] = _validate_sha256(
+            provenance.get(hash_field), field=f"evaluation.provenance.{hash_field}"
+        )
     if training_independence == "verified_holdout":
         missing_hashes = [
-            field for field in ["training_data_sha256", "model_sha256", "split_sha256"] if not normalized_provenance[field]
+            field
+            for field in ["training_data_sha256", "model_sha256", "split_sha256", "code_sha256"]
+            if not normalized_provenance[field]
         ]
         if missing_hashes:
             raise ValueError(
@@ -181,6 +328,15 @@ def validate_evaluation_manifest(config: Mapping[str, Any], *, task_type: str) -
         for key in ["min_lift_delta", "min_uncertainty_spearman", "max_calibration_gap_ratio"]:
             if key in custom_mapping:
                 thresholds[key] = _as_float(custom_mapping[key], field=f"evaluation.claim_thresholds.{key}")
+    if thresholds["min_test_rows"] < 1 or thresholds["min_num_clusters"] < 1:
+        raise ValueError("evaluation claim thresholds require at least one test row and one cluster.")
+    if not -1.0 <= thresholds["min_uncertainty_spearman"] <= 1.0:
+        raise ValueError("evaluation.claim_thresholds.min_uncertainty_spearman must be in [-1, 1].")
+    if thresholds["max_calibration_gap_ratio"] < 0:
+        raise ValueError("evaluation.claim_thresholds.max_calibration_gap_ratio must be non-negative.")
+
+    threshold_policy = _validate_threshold_policy(evaluation, custom_thresholds=bool(custom_thresholds))
+    prospective_protocol = _validate_prospective_protocol(evaluation)
 
     return EvaluationManifest(
         schema_version=schema_version,
@@ -194,6 +350,8 @@ def validate_evaluation_manifest(config: Mapping[str, Any], *, task_type: str) -
         biological_constraints=biological_constraints,
         provenance=normalized_provenance,
         claim_thresholds=thresholds,
+        threshold_policy=threshold_policy,
+        prospective_protocol=prospective_protocol,
     )
 
 
@@ -215,7 +373,13 @@ def inferred_manifest_for_args(*, task_type: str, positive_label: str | None = N
             "code_revision": "unknown",
             "duration_seconds": 0.0,
             "artifact_verification": "not_provided",
-            "dependency_versions": {"model_assessment": "0.1.0"},
+            "training_data_sha256": "",
+            "model_sha256": "",
+            "split_sha256": "",
+            "code_sha256": "",
+            "dependency_versions": {"assayready": "0.1.0"},
         },
         claim_thresholds=_default_thresholds(),
+        threshold_policy=_default_threshold_policy(),
+        prospective_protocol=None,
     )

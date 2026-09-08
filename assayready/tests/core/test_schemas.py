@@ -27,6 +27,7 @@ def _config() -> dict:
                 "training_data_sha256": "a" * 64,
                 "model_sha256": "b" * 64,
                 "split_sha256": "c" * 64,
+                "code_sha256": "d" * 64,
                 "dependency_versions": {"numpy": "2.4"},
             },
         }
@@ -45,7 +46,41 @@ def test_classification_manifest_requires_positive_label() -> None:
         validate_evaluation_manifest(_config(), task_type="classification")
 
 
-def test_inferred_manifest_cannot_support_claim_grade_recommendations() -> None:
+def test_inferred_manifest_is_explicitly_self_declared_and_uses_development_thresholds() -> None:
     manifest = inferred_manifest_for_args(task_type="regression").to_dict()
     assert manifest["training_independence"] == "unverified"
     assert manifest["constraints_verified"] is False
+    assert manifest["threshold_policy"]["source"] == "development_default"
+    assert manifest["prospective_protocol"] is None
+
+
+def test_verified_holdout_requires_code_hash() -> None:
+    config = _config()
+    del config["evaluation"]["provenance"]["code_sha256"]
+    with pytest.raises(ValueError, match="code_sha256"):
+        validate_evaluation_manifest(config, task_type="regression")
+
+
+def test_prospective_protocol_requires_selection_before_measurement() -> None:
+    config = _config()
+    config["evaluation"]["prospective_protocol"] = {
+        "protocol_identifier": "study-v1",
+        "candidate_selection_timestamp": "2026-08-05T12:00:00Z",
+        "measurement_timestamp": "2026-08-04T12:00:00Z",
+        "selection_manifest_path": "selected.csv",
+        "selection_manifest_sha256": "e" * 64,
+        "outcome_data_sha256": "f" * 64,
+    }
+    with pytest.raises(ValueError, match="must precede"):
+        validate_evaluation_manifest(config, task_type="regression")
+
+
+def test_empirical_threshold_policy_requires_assay_context() -> None:
+    config = _config()
+    config["evaluation"]["threshold_policy"] = {
+        "source": "empirically_validated",
+        "policy_name": "promoter-v1",
+        "rationale": "Historical assay study",
+    }
+    with pytest.raises(ValueError, match="must document"):
+        validate_evaluation_manifest(config, task_type="regression")

@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
 
 import numpy as np
@@ -448,6 +449,222 @@ def jaccard_similarity(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(left | right)
 
 
+_SIMILARITY_POLICY_ALIASES = {
+    "canonical_kmer_jaccard": "canonical_kmer_jaccard",
+    "kmer_jaccard": "canonical_kmer_jaccard",
+    "minhash_kmer": "canonical_kmer_jaccard",
+    "exact_reverse_complement": "exact_reverse_complement",
+    "edit_distance": "edit_distance",
+    "position_aware_motif": "position_aware_motif",
+    "customer_family_labels": "customer_family_labels",
+}
+_BUILTIN_SIMILARITY_POLICIES = frozenset(_SIMILARITY_POLICY_ALIASES.values())
+_RESERVED_DIVERSITY_POLICY_NAMES = frozenset(
+    {
+        "greedy_embedding_cosine",
+        "greedy_edit_distance",
+        "kmer_cosine",
+    }
+)
+_REGISTERED_SIMILARITY_POLICIES: dict[str, Callable[[str, str], float]] = {}
+_SIMILARITY_POLICY_LOCK = RLock()
+_SIMILARITY_POLICY_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _normalize_similarity_policy_name(name: str) -> str:
+    normalized = re.sub(r"[-\s]+", "_", str(name or "").strip().lower())
+    if not _SIMILARITY_POLICY_NAME.fullmatch(normalized):
+        raise ValueError(
+            "Similarity policy names must start with a letter and contain only "
+            "lowercase letters, digits, and underscores."
+        )
+    return normalized
+
+
+def register_similarity_policy(
+    name: str,
+    callback: Callable[[str, str], float],
+    *,
+    replace: bool = False,
+) -> str:
+    """Register an in-process assay-specific sequence-similarity callback.
+
+    Plugins are Python callables, not import paths. They receive two normalized
+    DNA sequences and must return a finite value in ``[0, 1]``. Built-in and
+    compatibility-alias names cannot be replaced.
+    """
+    normalized = _normalize_similarity_policy_name(name)
+    if normalized in _SIMILARITY_POLICY_ALIASES or normalized in _RESERVED_DIVERSITY_POLICY_NAMES:
+        raise ValueError(f"Similarity policy name {normalized!r} is reserved by AssayReady.")
+    if not callable(callback):
+        raise TypeError("Similarity policy callback must be callable.")
+    with _SIMILARITY_POLICY_LOCK:
+        if normalized in _REGISTERED_SIMILARITY_POLICIES and not replace:
+            raise ValueError(f"Similarity policy {normalized!r} is already registered.")
+        _REGISTERED_SIMILARITY_POLICIES[normalized] = callback
+    return normalized
+
+
+def unregister_similarity_policy(name: str) -> bool:
+    """Remove a previously registered plugin policy, returning whether it existed."""
+    normalized = _normalize_similarity_policy_name(name)
+    if normalized in _SIMILARITY_POLICY_ALIASES:
+        raise ValueError(f"Built-in similarity policy {normalized!r} cannot be unregistered.")
+    with _SIMILARITY_POLICY_LOCK:
+        return _REGISTERED_SIMILARITY_POLICIES.pop(normalized, None) is not None
+
+
+def registered_similarity_policies() -> tuple[str, ...]:
+    """Return registered plugin names in deterministic order."""
+    with _SIMILARITY_POLICY_LOCK:
+        return tuple(sorted(_REGISTERED_SIMILARITY_POLICIES))
+
+
+def _resolve_similarity_policy(name: str) -> tuple[str, str]:
+    requested = _normalize_similarity_policy_name(name)
+    resolved = _SIMILARITY_POLICY_ALIASES.get(requested, requested)
+    if resolved in _BUILTIN_SIMILARITY_POLICIES:
+        return requested, resolved
+    with _SIMILARITY_POLICY_LOCK:
+        if resolved in _REGISTERED_SIMILARITY_POLICIES:
+            return requested, resolved
+        registered = sorted(_REGISTERED_SIMILARITY_POLICIES)
+    available = sorted(set(_SIMILARITY_POLICY_ALIASES) | set(registered))
+    raise ValueError(
+        f"Unknown similarity_policy={name!r}. Available policies: {', '.join(available)}. "
+        "Register assay-specific or learned-embedding policies with register_similarity_policy()."
+    )
+
+
+def _position_aware_motif_tokens(sequence: str, *, k: int) -> set[tuple[int, str]]:
+    seq = normalize_sequence(sequence)
+    if not seq:
+        return set()
+    if len(seq) < k:
+        return {(0, seq)}
+    return {
+        (position, seq[position : position + k])
+        for position in range(0, len(seq) - k + 1)
+        if "N" not in seq[position : position + k]
+    }
+
+
+def _validated_similarity(value: Any, *, policy: str) -> float:
+    try:
+        similarity = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Similarity policy {policy!r} returned a non-numeric value.") from exc
+    if not math.isfinite(similarity) or not 0.0 <= similarity <= 1.0:
+        raise ValueError(f"Similarity policy {policy!r} must return a finite value in [0, 1]; got {value!r}.")
+    return similarity
+
+
+def sequence_similarity(
+    left: str,
+    right: str,
+    *,
+    policy: str | None = None,
+    similarity_policy: str | None = None,
+    k: int = 8,
+    left_row: dict[str, Any] | None = None,
+    right_row: dict[str, Any] | None = None,
+    group_cols: list[str] | tuple[str, ...] | None = None,
+) -> float:
+    """Compare two sequences using a named, auditable similarity policy."""
+    if int(k) <= 0:
+        raise ValueError(f"Similarity k must be positive, got {k}.")
+    selected_policy = similarity_policy or policy or "canonical_kmer_jaccard"
+    if policy is not None and similarity_policy is not None:
+        _policy_requested, policy_resolved = _resolve_similarity_policy(policy)
+        _similarity_requested, similarity_resolved = _resolve_similarity_policy(similarity_policy)
+        if policy_resolved != similarity_resolved:
+            raise ValueError(
+                f"Conflicting policy={policy!r} and similarity_policy={similarity_policy!r} arguments."
+            )
+    _requested, resolved = _resolve_similarity_policy(selected_policy)
+    left_norm = normalize_sequence(left)
+    right_norm = normalize_sequence(right)
+
+    if resolved == "canonical_kmer_jaccard":
+        value = jaccard_similarity(sequence_kmers(left_norm, k=int(k)), sequence_kmers(right_norm, k=int(k)))
+    elif resolved == "exact_reverse_complement":
+        left_canonical = min(left_norm, reverse_complement(left_norm))
+        right_canonical = min(right_norm, reverse_complement(right_norm))
+        value = float(left_canonical == right_canonical)
+    elif resolved == "edit_distance":
+        max_length = max(len(left_norm), len(right_norm), 1)
+        value = 1.0 - edit_distance(left_norm, right_norm) / max_length
+    elif resolved == "position_aware_motif":
+        value = jaccard_similarity(
+            _position_aware_motif_tokens(left_norm, k=int(k)),
+            _position_aware_motif_tokens(right_norm, k=int(k)),
+        )
+    elif resolved == "customer_family_labels":
+        columns = list(group_cols or [])
+        if not columns or left_row is None or right_row is None:
+            raise ValueError(
+                "customer_family_labels requires left_row, right_row, and at least one group_cols entry."
+            )
+        value = float(
+            any(
+                not _is_missing_value(left_row.get(column))
+                and not _is_missing_value(right_row.get(column))
+                and str(left_row.get(column)).strip() == str(right_row.get(column)).strip()
+                for column in columns
+            )
+        )
+    else:
+        with _SIMILARITY_POLICY_LOCK:
+            callback = _REGISTERED_SIMILARITY_POLICIES[resolved]
+        value = callback(left_norm, right_norm)
+    return _validated_similarity(value, policy=resolved)
+
+
+def _union_homologous_pairs(
+    rows: list[dict[str, Any]],
+    *,
+    sequence_col: str,
+    policy: str,
+    threshold: float,
+    k: int,
+    union_find: UnionFind,
+) -> dict[str, Any]:
+    """Deterministically union pairs selected by a generic similarity policy."""
+    possible_pairs = len(rows) * (len(rows) - 1) // 2
+    candidate_pairs = 0
+    homology_edges = 0
+    duplicate_rows = 0
+    component_skipped_pairs = 0
+    for right in range(1, len(rows)):
+        for left in range(right):
+            if union_find.find(left) == union_find.find(right):
+                component_skipped_pairs += 1
+                continue
+            candidate_pairs += 1
+            similarity = sequence_similarity(
+                str(rows[left].get(sequence_col, "") or ""),
+                str(rows[right].get(sequence_col, "") or ""),
+                policy=policy,
+                k=k,
+            )
+            if similarity >= threshold:
+                if normalize_sequence(rows[left].get(sequence_col)) == normalize_sequence(rows[right].get(sequence_col)):
+                    duplicate_rows += 1
+                union_find.union(left, right)
+                homology_edges += 1
+    return {
+        "homology_search_strategy": f"deterministic_pairwise_{policy}",
+        "homology_possible_pairs": possible_pairs,
+        "homology_prefix_candidates": candidate_pairs,
+        "homology_candidate_pairs": candidate_pairs,
+        "homology_candidate_fraction": candidate_pairs / possible_pairs if possible_pairs else 0.0,
+        "homology_edges": homology_edges,
+        "homology_duplicate_rows": duplicate_rows,
+        "homology_position_pruned_pairs": 0,
+        "homology_component_skipped_pairs": component_skipped_pairs,
+    }
+
+
 def _union_homologous_kmer_sets(
     kmers: list[set[str]],
     *,
@@ -559,10 +776,12 @@ def leakage_safe_split(
     group_cols: list[str] | None = None,
     homology_threshold: float = 0.90,
     homology_k: int = 8,
+    similarity_policy: str = "canonical_kmer_jaccard",
     seed: int = 13,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    """Split by groups and simple sequence homology clusters, never row order."""
+    """Split by declared groups and an explicitly named similarity policy."""
     group_cols = list(group_cols or [])
+    requested_similarity_policy, resolved_similarity_policy = _resolve_similarity_policy(similarity_policy)
     if not 0.0 <= float(val_fraction) < 1.0:
         raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
     if not 0.0 <= float(test_fraction) < 1.0:
@@ -573,11 +792,13 @@ def leakage_safe_split(
         raise ValueError(f"homology_threshold must be in [0, 1], got {homology_threshold}")
     if int(homology_k) <= 0:
         raise ValueError(f"homology_k must be positive, got {homology_k}")
-    if any(sequence_col not in row for row in rows):
+    if resolved_similarity_policy != "customer_family_labels" and any(sequence_col not in row for row in rows):
         raise ValueError(f"Every row must contain sequence column {sequence_col!r}.")
     absent_group_cols = [col for col in group_cols if not any(col in row for row in rows)]
     if absent_group_cols:
         raise ValueError(f"Configured group columns are absent from all rows: {absent_group_cols}")
+    if resolved_similarity_policy == "customer_family_labels" and not group_cols:
+        raise ValueError("customer_family_labels similarity policy requires at least one group_cols entry.")
 
     n_rows = len(rows)
     uf = UnionFind(n_rows)
@@ -607,11 +828,22 @@ def leakage_safe_split(
         "homology_position_pruned_pairs": 0,
         "homology_component_skipped_pairs": 0,
     }
-    if homology_threshold > 0 and n_rows > 1:
+    if resolved_similarity_policy == "customer_family_labels":
+        homology_search["homology_search_strategy"] = "customer_family_labels_only"
+    elif homology_threshold > 0 and n_rows > 1 and resolved_similarity_policy == "canonical_kmer_jaccard":
         kmers = [sequence_kmers(row.get(sequence_col, ""), k=homology_k) for row in rows]
         homology_search = _union_homologous_kmer_sets(
             kmers,
             threshold=homology_threshold,
+            union_find=uf,
+        )
+    elif homology_threshold > 0 and n_rows > 1:
+        homology_search = _union_homologous_pairs(
+            rows,
+            sequence_col=sequence_col,
+            policy=resolved_similarity_policy,
+            threshold=homology_threshold,
+            k=homology_k,
             union_find=uf,
         )
 
@@ -629,7 +861,7 @@ def leakage_safe_split(
                 for col in group_cols
                 if not _is_missing_value(row.get(col))
             ]
-            members.append("|".join([stable_sequence_hash(row[sequence_col]), *group_values]))
+            members.append("|".join([stable_sequence_hash(row.get(sequence_col, "")), *group_values]))
         return hashlib.sha256("\n".join(sorted(members)).encode("utf-8")).hexdigest()
 
     cluster_ids = {id(cluster): cluster_fingerprint(cluster) for cluster in clusters}
@@ -645,6 +877,9 @@ def leakage_safe_split(
         "num_clusters": len(clusters),
         "group_cols": group_cols,
         "group_semantics": "shared non-missing value in any configured group column",
+        "similarity_policy": resolved_similarity_policy,
+        "similarity_policy_requested": requested_similarity_policy,
+        "similarity_threshold": homology_threshold,
         "homology_threshold": homology_threshold,
         "homology_k": homology_k,
         "warnings": [],
@@ -692,6 +927,16 @@ def leakage_safe_split(
         with_split["leakage_cluster"] = cluster_ids[id(cluster)][:16]
         splits[split].append(with_split)
     diagnostics["split_sizes"] = {key: len(value) for key, value in splits.items()}
+    diagnostics["split_cluster_counts"] = {
+        key: len(
+            {
+                str(row.get("leakage_cluster"))
+                for row in split_rows
+                if str(row.get("leakage_cluster") or "").strip()
+            }
+        )
+        for key, split_rows in splits.items()
+    }
     if not splits["val"] or not splits["test"]:
         required_empty = []
         if val_fraction > 0 and not splits["val"]:
@@ -983,7 +1228,7 @@ def generate_de_novo_candidate_pool(
                     "novelty_edit_distance": int(novelty),
                     "novelty_score": float(novelty / max(1, length)),
                     "synthesis_status": "passed_filters",
-                    "recommendation_reason": "in_silico_design_requires_wet_lab_validation",
+                    "prioritization_note": "in_silico_design_requires_scientist_review_and_wet_lab_validation",
                 }
             )
         if not batch:
@@ -1227,6 +1472,7 @@ def run_baselines(
     target_col: str,
     seed: int = 13,
     positive_label: Any | None = None,
+    include_predictions: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Fit simple comparison baselines on the caller-provided train/test split."""
     baselines: dict[str, dict[str, Any]] = {}
@@ -1260,6 +1506,26 @@ def run_baselines(
     except Exception:
         sklearn_ok = False
 
+    def store_baseline(
+        name: str,
+        predictions: np.ndarray,
+        metric_fn: Callable[[Any, Any], dict[str, Any]],
+        y_test: np.ndarray,
+        *,
+        status: str | None = None,
+    ) -> None:
+        aligned_predictions = np.asarray(predictions, dtype=np.float64).reshape(-1)
+        if len(aligned_predictions) != len(test_rows):
+            raise ValueError(
+                f"Baseline {name!r} produced {len(aligned_predictions)} predictions for {len(test_rows)} test rows."
+            )
+        metrics = metric_fn(y_test, aligned_predictions)
+        if status is not None:
+            metrics["status"] = status
+        if include_predictions:
+            metrics["test_predictions"] = [float(value) for value in aligned_predictions]
+        baselines[name] = metrics
+
     if task_type == "classification":
         y_train, mapping = encode_class_labels(
             [row[target_col] for row in train_rows],
@@ -1271,19 +1537,39 @@ def run_baselines(
         if sklearn_ok and len(set(y_train.tolist())) >= 2:
             gc_model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, random_state=seed))
             gc_model.fit(x_train_gc, y_train)
-            baselines["gc_length_baseline"] = classification_metrics(y_test, gc_model.predict_proba(x_test_gc)[:, 1])
+            store_baseline(
+                "gc_length_baseline",
+                gc_model.predict_proba(x_test_gc)[:, 1],
+                classification_metrics,
+                y_test,
+            )
 
             kmer_model = make_pipeline(StandardScaler(with_mean=False), LogisticRegression(max_iter=1000, random_state=seed))
             kmer_model.fit(x_train_kmer, y_train)
-            baselines["kmer_ridge_or_logistic"] = classification_metrics(y_test, kmer_model.predict_proba(x_test_kmer)[:, 1])
+            store_baseline(
+                "kmer_ridge_or_logistic",
+                kmer_model.predict_proba(x_test_kmer)[:, 1],
+                classification_metrics,
+                y_test,
+            )
 
             rf = RandomForestClassifier(n_estimators=100, min_samples_leaf=2, random_state=seed)
             rf.fit(x_train_kmer, y_train)
-            baselines["kmer_random_forest"] = classification_metrics(y_test, rf.predict_proba(x_test_kmer)[:, 1])
+            store_baseline(
+                "kmer_random_forest",
+                rf.predict_proba(x_test_kmer)[:, 1],
+                classification_metrics,
+                y_test,
+            )
 
             probe = make_pipeline(StandardScaler(with_mean=False), LogisticRegression(max_iter=1000, random_state=seed))
             probe.fit(x_train_embed, y_train)
-            baselines["kmer4_linear_probe"] = classification_metrics(y_test, probe.predict_proba(x_test_embed)[:, 1])
+            store_baseline(
+                "kmer4_linear_probe",
+                probe.predict_proba(x_test_embed)[:, 1],
+                classification_metrics,
+                y_test,
+            )
         else:
             for name, x_train, x_test in [
                 ("gc_length_baseline", x_train_gc, x_test_gc),
@@ -1292,8 +1578,7 @@ def run_baselines(
                 ("kmer4_linear_probe", x_train_embed, x_test_embed),
             ]:
                 score = _fit_logistic_fallback(x_train, y_train, x_test)
-                baselines[name] = classification_metrics(y_test, score)
-                baselines[name]["status"] = "fallback"
+                store_baseline(name, score, classification_metrics, y_test, status="fallback")
     else:
         y_train = np.asarray([float(row[target_col]) for row in train_rows], dtype=np.float64)
         y_test = np.asarray([float(row[target_col]) for row in test_rows], dtype=np.float64)
@@ -1301,19 +1586,19 @@ def run_baselines(
         if sklearn_ok:
             gc_model = make_pipeline(StandardScaler(), Ridge(alpha=1.0, random_state=seed))
             gc_model.fit(x_train_gc, y_train)
-            baselines["gc_length_baseline"] = metric_fn(y_test, gc_model.predict(x_test_gc))
+            store_baseline("gc_length_baseline", gc_model.predict(x_test_gc), metric_fn, y_test)
 
             kmer_model = make_pipeline(StandardScaler(with_mean=False), Ridge(alpha=1.0, random_state=seed))
             kmer_model.fit(x_train_kmer, y_train)
-            baselines["kmer_ridge_or_logistic"] = metric_fn(y_test, kmer_model.predict(x_test_kmer))
+            store_baseline("kmer_ridge_or_logistic", kmer_model.predict(x_test_kmer), metric_fn, y_test)
 
             rf = RandomForestRegressor(n_estimators=100, min_samples_leaf=2, random_state=seed)
             rf.fit(x_train_kmer, y_train)
-            baselines["kmer_random_forest"] = metric_fn(y_test, rf.predict(x_test_kmer))
+            store_baseline("kmer_random_forest", rf.predict(x_test_kmer), metric_fn, y_test)
 
             probe = make_pipeline(StandardScaler(with_mean=False), Ridge(alpha=1.0, random_state=seed))
             probe.fit(x_train_embed, y_train)
-            baselines["kmer4_linear_probe"] = metric_fn(y_test, probe.predict(x_test_embed))
+            store_baseline("kmer4_linear_probe", probe.predict(x_test_embed), metric_fn, y_test)
         else:
             for name, x_train, x_test in [
                 ("gc_length_baseline", x_train_gc, x_test_gc),
@@ -1322,8 +1607,7 @@ def run_baselines(
                 ("kmer4_linear_probe", x_train_embed, x_test_embed),
             ]:
                 pred = _fit_linear_regression(x_train, y_train, x_test)
-                baselines[name] = metric_fn(y_test, pred)
-                baselines[name]["status"] = "fallback"
+                store_baseline(name, pred, metric_fn, y_test, status="fallback")
 
     for metrics in baselines.values():
         metrics["primary_metric"] = _primary_metric(task_type, metrics)
@@ -1703,16 +1987,59 @@ def cosine_similarity_matrix(features: np.ndarray) -> np.ndarray:
 
 
 def _edit_similarity(left: str, right: str) -> float:
-    try:
-        from rapidfuzz.distance import Levenshtein
+    return sequence_similarity(left, right, policy="edit_distance")
 
-        distance = Levenshtein.distance(left, right)
-    except Exception:
-        max_len = max(len(left), len(right), 1)
-        distance = sum(a != b for a, b in zip(left, right)) + abs(len(left) - len(right))
-        return 1.0 - distance / max_len
-    max_len = max(len(left), len(right), 1)
-    return 1.0 - distance / max_len
+
+_DIVERSITY_POLICY_ALIASES = {
+    "greedy_embedding_cosine": "kmer_cosine",
+    "kmer_cosine": "kmer_cosine",
+    "greedy_edit_distance": "edit_distance",
+    "edit_distance": "edit_distance",
+    "exact_reverse_complement": "exact_reverse_complement",
+    "canonical_kmer_jaccard": "kmer_jaccard",
+    "kmer_jaccard": "kmer_jaccard",
+    "minhash_kmer": "kmer_jaccard",
+    "position_aware_motif": "position_aware_motif",
+}
+
+
+def _resolve_diversity_policy(method: str) -> tuple[str, str, str | None]:
+    requested = _normalize_similarity_policy_name(method)
+    if requested in _DIVERSITY_POLICY_ALIASES:
+        resolved = _DIVERSITY_POLICY_ALIASES[requested]
+        sequence_policy = {
+            "edit_distance": "edit_distance",
+            "exact_reverse_complement": "exact_reverse_complement",
+            "kmer_jaccard": "canonical_kmer_jaccard",
+            "position_aware_motif": "position_aware_motif",
+        }.get(resolved)
+        return requested, resolved, sequence_policy
+    try:
+        _plugin_requested, plugin_policy = _resolve_similarity_policy(requested)
+    except ValueError as exc:
+        supported = sorted(_DIVERSITY_POLICY_ALIASES)
+        raise ValueError(
+            f"Unsupported diversity method={method!r}. Supported built-ins: {', '.join(supported)}; "
+            "registered similarity plugins are also accepted."
+        ) from exc
+    if plugin_policy == "customer_family_labels":
+        raise ValueError("customer_family_labels is group-based and cannot be used as a sequence diversity method.")
+    return requested, plugin_policy, plugin_policy
+
+
+def _pairwise_sequence_similarity_matrix(
+    sequences: list[str],
+    *,
+    policy: str,
+    k: int,
+) -> np.ndarray:
+    matrix = np.eye(len(sequences), dtype=np.float32)
+    for right in range(1, len(sequences)):
+        for left in range(right):
+            similarity = sequence_similarity(sequences[left], sequences[right], policy=policy, k=k)
+            matrix[left, right] = similarity
+            matrix[right, left] = similarity
+    return matrix
 
 
 def greedy_diverse_rank(
@@ -1723,42 +2050,64 @@ def greedy_diverse_rank(
     method: str = "greedy_embedding_cosine",
     diversity_penalty: float = 0.2,
     top_k: int = 96,
+    similarity_k: int = 3,
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
+    requested_policy, resolved_policy, sequence_policy = _resolve_diversity_policy(method)
+    if int(similarity_k) <= 0:
+        raise ValueError(f"similarity_k must be positive, got {similarity_k}.")
+    acquisition_values = np.asarray(acquisition, dtype=np.float64).reshape(-1)
+    if len(acquisition_values) != len(rows):
+        raise ValueError(
+            f"acquisition must contain one score per row; got {len(acquisition_values)} scores for {len(rows)} rows."
+        )
     top_k = min(top_k, len(rows))
-    features = kmer_feature_matrix([row[sequence_col] for row in rows], k=3)
-    cosine = cosine_similarity_matrix(features)
+    sequences = [row[sequence_col] for row in rows]
+    if resolved_policy == "kmer_cosine":
+        # Preserve the historical default: 3-mer frequencies plus GC/length
+        # features, now named explicitly instead of implying learned embeddings.
+        features = kmer_feature_matrix(sequences, k=int(similarity_k))
+        similarities = cosine_similarity_matrix(features)
+    else:
+        if sequence_policy is None:  # Defensive guard for future built-ins.
+            raise ValueError(f"Diversity policy {resolved_policy!r} has no sequence-similarity implementation.")
+        similarities = _pairwise_sequence_similarity_matrix(
+            sequences,
+            policy=sequence_policy,
+            k=int(similarity_k),
+        )
     selected: list[int] = []
     remaining = set(range(len(rows)))
     clusters = [-1 for _ in rows]
     selected_scores: dict[int, float] = {}
+    selected_similarities: dict[int, float] = {}
 
     for rank in range(1, top_k + 1):
         best_idx = None
         best_score = -float("inf")
-        for idx in remaining:
+        best_similarity = 0.0
+        for idx in sorted(remaining):
             if selected:
-                if method == "greedy_edit_distance":
-                    similarity = max(_edit_similarity(rows[idx][sequence_col], rows[sel][sequence_col]) for sel in selected)
-                else:
-                    similarity = max(float(cosine[idx, sel]) for sel in selected)
+                similarity = max(float(similarities[idx, selected_idx]) for selected_idx in selected)
             else:
                 similarity = 0.0
-            score = float(acquisition[idx]) - diversity_penalty * similarity
+            score = float(acquisition_values[idx]) - diversity_penalty * similarity
             if score > best_score:
                 best_score = score
                 best_idx = idx
+                best_similarity = similarity
         if best_idx is None:
             break
         remaining.remove(best_idx)
         selected.append(best_idx)
         selected_scores[best_idx] = best_score
+        selected_similarities[best_idx] = best_similarity
         clusters[best_idx] = rank
-        for idx in remaining:
+        for idx in sorted(remaining):
             if clusters[idx] != -1:
                 continue
-            similarity = float(cosine[idx, best_idx])
+            similarity = float(similarities[idx, best_idx])
             if similarity >= 0.95:
                 clusters[idx] = rank
 
@@ -1767,8 +2116,14 @@ def greedy_diverse_rank(
         row = dict(rows[idx])
         row["rank"] = rank
         row["diversity_cluster"] = clusters[idx] if clusters[idx] != -1 else rank
-        row["diversified_acquisition_score"] = float(selected_scores.get(idx, acquisition[idx]))
-        row["recommendation"] = True
+        row["diversified_acquisition_score"] = float(selected_scores.get(idx, acquisition_values[idx]))
+        row["max_similarity_to_previous_selection"] = float(selected_similarities.get(idx, 0.0))
+        row["diversity_penalty_applied"] = float(
+            diversity_penalty * selected_similarities.get(idx, 0.0)
+        )
+        row["diversity_policy"] = resolved_policy
+        row["diversity_policy_requested"] = requested_policy
+        row["prioritization_status"] = "unreviewed_candidate_prioritization"
         ranked.append(row)
     return ranked
 

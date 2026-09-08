@@ -19,6 +19,9 @@ EXPECTED_RESOURCES = [
     "examples/public_dream_promoter_audit.json",
     "examples/public_dream_promoter_candidates.csv",
     "examples/public_dream_promoter_predictions.csv",
+    "model_bundles/dnabert2_117m/Dockerfile",
+    "model_bundles/dnabert2_117m/train_head.py",
+    "model_bundles/dnabert2_117m/predict.py",
 ]
 
 
@@ -35,7 +38,7 @@ def main() -> None:
     installed_package = Path(model_assessment.__file__).resolve().parent
     if installed_package == source_package.resolve():
         raise RuntimeError("Smoke test imported the source tree instead of the installed wheel.")
-    if metadata.version("model-assessment") != model_assessment.__version__:
+    if metadata.version("assayready") != model_assessment.__version__:
         raise RuntimeError("Wheel metadata and package versions differ.")
 
     package_root = resources.files("model_assessment")
@@ -66,9 +69,13 @@ def main() -> None:
                 cwd=temp_dir,
             )
         output_dir = temp_dir / "outputs" / "assayready" / "example_prediction_audit"
-        report_path = output_dir / "prediction_audit_report.json"
-        if not report_path.is_file():
-            raise RuntimeError(f"Installed-wheel audit did not write {report_path}")
+        report_paths = sorted(output_dir.glob("*/prediction_audit_report.json"))
+        if len(report_paths) != 1:
+            raise RuntimeError(
+                "Installed-wheel audit should write exactly one immutable run report under "
+                f"{output_dir}; found {report_paths}"
+            )
+        report_path = report_paths[0]
         report = json.loads(report_path.read_text(encoding="utf-8"))
         if not report.get("verdict"):
             raise RuntimeError("Installed-wheel audit report has no verdict.")

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
-from model_assessment.cli import _rank_external_predictions, _claim_gate
+from model_assessment.cli import (
+    _claim_gate,
+    _observed_incumbent,
+    _rank_external_predictions,
+    _ranking_audit,
+)
 
 
 def test_rank_external_predictions_minimization() -> None:
@@ -24,6 +29,7 @@ def test_rank_external_predictions_minimization() -> None:
         sequence_col="seq",
         prediction_col="prediction",
         uncertainty_col="uncertainty",
+        uncertainty_type="predictive_standard_deviation",
         beta=1.0,
         diversity_method="greedy_embedding_cosine",
         diversity_penalty=0.0,
@@ -40,9 +46,7 @@ def test_rank_external_predictions_minimization() -> None:
     assert ranked[1]["acquisition_score"] == 8.0
 
 
-def test_recommendation_gate_in_claim_gate() -> None:
-    # If claim gates pass, recommended is ok.
-    # Otherwise, recommended is not ok.
+def test_candidate_prioritization_check_in_claim_gate() -> None:
     evaluation_manifest = {
         "claim_thresholds": {
             "min_test_rows": 2,
@@ -65,7 +69,8 @@ def test_recommendation_gate_in_claim_gate() -> None:
         ranked_candidates=10,
         evaluation_manifest=evaluation_manifest,
     )
-    assert gate_pass["recommended"]["ok"] is True
+    assert gate_pass["candidate_prioritization"]["ok"] is True
+    assert "recommended" not in gate_pass
 
     # Case 2: Fail due to baseline beating model
     gate_fail_lift = _claim_gate(
@@ -78,7 +83,7 @@ def test_recommendation_gate_in_claim_gate() -> None:
         ranked_candidates=10,
         evaluation_manifest=evaluation_manifest,
     )
-    assert gate_fail_lift["recommended"]["ok"] is False
+    assert gate_fail_lift["candidate_prioritization"]["ok"] is False
 
 
 def test_metric_lift_stays_higher_is_better_for_minimization_targets() -> None:
@@ -100,7 +105,7 @@ def test_metric_lift_stays_higher_is_better_for_minimization_targets() -> None:
     assert gate["lift_claim"]["ok"] is True
 
 
-def test_external_recommendation_requires_verified_holdout() -> None:
+def test_external_evidence_check_requires_verified_holdout() -> None:
     gate = _claim_gate(
         task_type="regression",
         split_diagnostics={"split_sizes": {"test": 5}, "num_clusters": 2},
@@ -117,4 +122,57 @@ def test_external_recommendation_requires_verified_holdout() -> None:
         external_predictions=True,
     )
     assert gate["leakage_controlled"]["ok"] is False
-    assert gate["recommended"]["ok"] is False
+    assert gate["candidate_prioritization"]["ok"] is False
+
+
+def test_missing_uncertainty_uses_explicit_prediction_only_policy() -> None:
+    ranked = _rank_external_predictions(
+        [
+            {"seq": "AAAA", "prediction": 1.0, "uncertainty": None},
+            {"seq": "CCCC", "prediction": 0.5, "uncertainty": 0.2},
+        ],
+        sequence_col="seq",
+        prediction_col="prediction",
+        uncertainty_col="uncertainty",
+        uncertainty_type="predictive_standard_deviation",
+        beta=1.0,
+        diversity_method="kmer_cosine",
+        diversity_penalty=0.0,
+        top_k=2,
+    )
+    assert {row["acquisition_policy"] for row in ranked} == {"prediction_only"}
+    missing = next(row for row in ranked if row["seq"] == "AAAA")
+    assert missing["uncertainty"] is None
+    assert "missing_or_invalid" in missing["uncertainty_status"]
+
+
+def test_minimization_ranking_audit_uses_low_values_as_best() -> None:
+    result = _ranking_audit(
+        [
+            {"target": 10.0, "prediction": 9.0},
+            {"target": 1.0, "prediction": 2.0},
+            {"target": 5.0, "prediction": 6.0},
+        ],
+        task_type="regression",
+        target_col="target",
+        prediction_col="prediction",
+        top_k=1,
+        positive_label=None,
+        objective_direction="minimize",
+    )
+    assert result["best_true_item_rank_by_prediction"] == 1
+    assert result["top_k_target_mean"] == 1.0
+    assert result["objective_direction"] == "minimize"
+
+
+def test_minimization_incumbent_is_lowest_observed_target() -> None:
+    rows = [{"target": 7.0}, {"target": 2.0}, {"target": 4.0}]
+    assert (
+        _observed_incumbent(
+            rows,
+            target_col="target",
+            task_type="regression",
+            objective_direction="minimize",
+        )
+        == 2.0
+    )

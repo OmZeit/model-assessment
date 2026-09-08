@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from unittest import mock
 import subprocess
@@ -24,7 +25,11 @@ def test_golden_public_dream_audit(tmp_path: Path) -> None:
         json.dump(config_data, f)
         
     # 3. Run the CLI
-    env = {"PYTHONPATH": str(project_root.parent)}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(project_root.parent),
+        "ASSAYREADY_RUN_DB": str(tmp_path / "runs.sqlite"),
+    }
     cmd = [
         sys.executable,
         "-m",
@@ -53,6 +58,9 @@ def test_golden_public_dream_audit(tmp_path: Path) -> None:
         "ranked_candidates.csv",
         "prediction_audit_report.md",
         "prediction_audit_report.json",
+        "candidate_prioritization.csv",
+        "baseline_predictions.csv",
+        "similarity_sensitivity.json",
         "data_audit_report.json",
         "data_audit_report.md",
     ]
@@ -64,3 +72,9 @@ def test_golden_public_dream_audit(tmp_path: Path) -> None:
         
     assert "prediction_audit" in run_data
     assert run_data["project"] == "public_dream_promoter_audit"
+    report = run_data["prediction_audit"]
+    assert report["assurance_level"]["key"] == "self_declared"
+    assert report["evidence_level"]["key"] in {"descriptive_audit_only", "insufficient_evidence"}
+    assert "Recommended" not in report["verdict"]
+    assert "threshold_sensitivity" in report
+    assert "similarity_sensitivity" in report

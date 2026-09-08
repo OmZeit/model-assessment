@@ -1,7 +1,7 @@
 # Pixi owns compiled/runtime dependencies in pixi.toml and pixi.lock.
 # This file is a small PyPI overlay for manual installs inside the
-# Pixi model-assessment environment:
+# Pixi assayready environment:
 #
-#   pixi run --environment model-assessment python -m pip install --no-deps --no-build-isolation -r requirement.txt
+#   pixi run --environment assayready python -m pip install --no-deps --no-build-isolation -r requirement.txt
 #
--e .
+.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -33,14 +34,20 @@ from .ml_core.specialization import (
     leakage_safe_split,
     predict_with_task_head_ensemble,
     run_baselines,
+    sequence_similarity,
     sequence_kmers,
     stable_sequence_hash,
     write_table,
     normal_cdf,
     normal_pdf,
 )
-from .run_store import get_run_summary, list_runs, record_run
+from .run_store import default_output_root, get_run_summary, list_runs, record_run
 from .schemas import inferred_manifest_for_args, validate_evaluation_manifest
+from .batch_design import BatchDesignPolicy, design_batch
+from .campaigns import CampaignStore
+from .controlled_execution import execute_locked_container, load_execution_spec
+from .policies import load_policy_pack, policy_pack_names
+from .open_models import download_dnabert2, ensure_dnabert2_scaffold, scaffold_dnabert2_bundle
 
 
 def _json_default(value: Any) -> Any:
@@ -139,8 +146,6 @@ def _doctor_checks() -> list[dict[str, Any]]:
         "PyYAML": "yaml",
         "rapidfuzz": "rapidfuzz",
         "scikit-learn": "sklearn",
-        "tokenizers": "tokenizers",
-        "torch": "torch",
     }
     missing_modules = [name for name, import_name in required_modules.items() if not _module_available(import_name)]
     checks.append(
@@ -150,6 +155,74 @@ def _doctor_checks() -> list[dict[str, Any]]:
             "all required runtime modules are importable" if not missing_modules else "missing: " + ", ".join(missing_modules),
         )
     )
+    modeling_modules = {
+        "tokenizers": "tokenizers",
+        "torch": "torch",
+    }
+    missing_modeling = [
+        name for name, import_name in modeling_modules.items() if not _module_available(import_name)
+    ]
+    checks.append(
+        _doctor_item(
+            "optional modeling imports",
+            not missing_modeling,
+            (
+                "local model-training extras are importable"
+                if not missing_modeling
+                else "not installed (prediction-table audits still work): " + ", ".join(missing_modeling)
+            ),
+            required=False,
+        )
+    )
+    foundation_modules = {
+        "einops": "einops",
+        "huggingface-hub": "huggingface_hub",
+        "safetensors": "safetensors",
+        "transformers": "transformers",
+    }
+    missing_foundation = [
+        name for name, import_name in foundation_modules.items() if not _module_available(import_name)
+    ]
+    checks.append(
+        _doctor_item(
+            "optional foundation-model imports",
+            not missing_foundation,
+            (
+                "direct DNABERT-2 setup dependencies are importable"
+                if not missing_foundation
+                else "not installed (use the foundation-models extra): " + ", ".join(missing_foundation)
+            ),
+            required=False,
+        )
+    )
+    server_missing = [name for name in ("fastapi", "uvicorn") if not _module_available(name)]
+    checks.append(
+        _doctor_item(
+            "optional API server",
+            not server_missing,
+            "API server dependencies are importable" if not server_missing else (
+                "not installed (CLI and local UI still work): " + ", ".join(server_missing)
+            ),
+            required=False,
+        )
+    )
+    container_runtime = shutil.which("docker") or shutil.which("podman")
+    checks.append(
+        _doctor_item(
+            "controlled-execution runtime",
+            container_runtime is not None,
+            container_runtime or "Docker or Podman is required only for locked model execution.",
+            required=False,
+        )
+    )
+    try:
+        bundled_policies = policy_pack_names()
+    except Exception as exc:
+        bundled_policies = []
+        policy_detail = str(exc)
+    else:
+        policy_detail = ", ".join(bundled_policies)
+    checks.append(_doctor_item("policy packs", bool(bundled_policies), policy_detail))
 
     public_demo_files = [
         root / "examples" / "public_dream_promoter_audit.json",
@@ -165,7 +238,7 @@ def _doctor_checks() -> list[dict[str, Any]]:
         )
     )
 
-    output_root = Path("outputs") / "assayready"
+    output_root = default_output_root()
     try:
         output_root.mkdir(parents=True, exist_ok=True)
         probe = output_root / ".doctor-write-test"
@@ -222,6 +295,141 @@ def run_registry_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_campaign_command(args: argparse.Namespace) -> int:
+    store = CampaignStore(args.db)
+    if args.campaign_command == "create":
+        result = store.create_campaign(
+            campaign_id=args.campaign_id,
+            name=args.name,
+            assay_type=args.assay_type,
+            objective_direction=args.objective_direction,
+            owner=args.owner,
+            actor=args.actor,
+        )
+    elif args.campaign_command == "list":
+        result = store.list_campaigns()
+    elif args.campaign_command == "add-round":
+        policy = load_policy_pack(args.policy_pack) if args.policy_pack else None
+        result = store.register_round(
+            campaign_id=args.campaign_id,
+            round_number=args.round_number,
+            model_version=args.model_version,
+            dataset_version=args.dataset_version,
+            selection_file=args.selection,
+            id_column=args.id_column,
+            prediction_column=args.prediction_column,
+            uncertainty_column=args.uncertainty_column,
+            family_column=args.family_column,
+            run_id=args.run_id,
+            policy_name=policy["name"] if policy else None,
+            policy_sha256=policy["sha256"] if policy else None,
+            selected_at=args.selected_at,
+            actor=args.actor,
+        )
+    elif args.campaign_command == "import-outcomes":
+        result = store.import_outcomes(
+            round_id=args.round_id,
+            outcome_file=args.outcomes,
+            id_column=args.id_column,
+            value_column=args.value_column,
+            replicate_column=args.replicate_column,
+            batch_column=args.batch_column,
+            cost_column=args.cost_column,
+            measured_at=args.measured_at,
+            actor=args.actor,
+        )
+    elif args.campaign_command == "compare":
+        result = store.compare_rounds(args.campaign_id)
+    elif args.campaign_command == "export":
+        result = store.export_campaign(args.campaign_id)
+        if args.output:
+            _write_json(Path(args.output).resolve(), result)
+    elif args.campaign_command == "protocol":
+        result = store.prospective_protocol(args.round_id)
+        if args.output:
+            _write_json(Path(args.output).resolve(), result)
+    elif args.campaign_command == "archive":
+        result = store.archive_campaign(args.campaign_id, actor=args.actor)
+    elif args.campaign_command == "purge":
+        result = store.purge_campaign(
+            args.campaign_id, confirmation=args.confirm, actor=args.actor
+        )
+    else:
+        result = store.verify_audit_chain()
+    print(json.dumps(result, indent=2, sort_keys=True, default=_json_default))
+    return 0 if not isinstance(result, dict) or result.get("ok", True) else 1
+
+
+def run_policy_command(args: argparse.Namespace) -> int:
+    if args.policy_command == "list":
+        result: Any = policy_pack_names()
+    else:
+        result = load_policy_pack(args.name)
+    print(json.dumps(result, indent=2, sort_keys=True, default=_json_default))
+    return 0
+
+
+def _objective_weights(values: list[str]) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError("objective weights must use column=weight syntax.")
+        column, weight = value.split("=", 1)
+        if not column.strip():
+            raise ValueError("objective-weight column may not be empty.")
+        weights[column.strip()] = float(weight)
+    return weights
+
+
+def run_batch_design_command(args: argparse.Namespace) -> int:
+    candidate_path = Path(args.candidates).resolve()
+    with candidate_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        candidates = list(csv.DictReader(handle))
+    pack = load_policy_pack(args.policy_pack)
+    configured = pack["batch_design"]
+    policy = BatchDesignPolicy(
+        plate_size=int(configured.get("plate_size", 96)),
+        controls={str(key): int(value) for key, value in (configured.get("controls") or {}).items()},
+        candidate_replicates=int(configured.get("candidate_replicates", 1)),
+        family_column=args.family_column or configured.get("family_column"),
+        max_per_family=args.max_per_family or configured.get("max_per_family"),
+        cost_column=args.cost_column,
+        max_total_cost=args.max_total_cost,
+        required_columns=tuple(configured.get("required_columns") or ["sequence"]),
+        exclude_edge_wells=bool(configured.get("exclude_edge_wells", False)),
+        seed=args.seed,
+    )
+    result = design_batch(
+        candidates,
+        policy=policy,
+        objective_weights=_objective_weights(args.objective_weight),
+        scientist_approval=args.scientist_approval,
+    )
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_table(output, result["assignments"])
+    _write_json(output.with_suffix(".manifest.json"), {key: value for key, value in result.items() if key != "assignments"})
+    print(json.dumps({**result, "assignments": f"written to {output}"}, indent=2, sort_keys=True, default=_json_default))
+    return 0
+
+
+def run_model_command(args: argparse.Namespace) -> int:
+    if args.model_command == "execute":
+        result = execute_locked_container(load_execution_spec(args.spec))
+    elif args.model_command == "scaffold-dnabert2":
+        result = {"bundle_dir": str(scaffold_dnabert2_bundle(args.output_dir))}
+    elif args.model_command == "download-dnabert2":
+        result = download_dnabert2(args.output_dir)
+    else:
+        bundle = ensure_dnabert2_scaffold(args.output_dir)
+        result = {
+            "bundle_dir": str(bundle),
+            "model": download_dnabert2(bundle / "weights"),
+        }
+    print(json.dumps(result, indent=2, sort_keys=True, default=_json_default))
+    return 0
+
+
 def _resolve_paths(paths: list[str | Path], *, base_dir: Path) -> list[Path]:
     resolved: list[Path] = []
     for raw in paths:
@@ -235,6 +443,19 @@ def _resolve_paths(paths: list[str | Path], *, base_dir: Path) -> list[Path]:
                 break
         else:
             resolved.append((base_dir / candidate).resolve())
+    return resolved
+
+
+def _resolve_manifest_paths(manifest: dict[str, Any], *, base_dir: Path) -> dict[str, Any]:
+    resolved = dict(manifest)
+    protocol = resolved.get("prospective_protocol")
+    if protocol:
+        resolved_protocol = dict(protocol)
+        raw_path = Path(str(resolved_protocol["selection_manifest_path"]))
+        if not raw_path.is_absolute():
+            raw_path = base_dir / raw_path
+        resolved_protocol["selection_manifest_path"] = str(raw_path.resolve())
+        resolved["prospective_protocol"] = resolved_protocol
     return resolved
 
 
@@ -321,6 +542,7 @@ def _params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "test_fraction": args.test_fraction,
         "homology_threshold": args.homology_threshold,
         "homology_k": args.homology_k,
+        "similarity_policy": args.similarity_policy,
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,
         "ensemble_size": args.ensemble_size,
@@ -351,6 +573,7 @@ def _params_from_config(config: dict[str, Any], *, config_dir: Path) -> dict[str
 
     task_type = str(task.get("type", config.get("task_type", "regression"))).lower()
     manifest = validate_evaluation_manifest(config, task_type=task_type)
+    manifest_dict = _resolve_manifest_paths(manifest.to_dict(), base_dir=config_dir)
 
     assay_files = _as_list(config.get("assay") or ingestion.get("raw_files"))
     candidate_files = _as_list(config.get("candidate_files") or candidates.get("raw_files"))
@@ -376,20 +599,23 @@ def _params_from_config(config: dict[str, Any], *, config_dir: Path) -> dict[str
         "test_fraction": float(split.get("test_fraction", config.get("test_fraction", 0.15))),
         "homology_threshold": float(split.get("homology_threshold", config.get("homology_threshold", 0.90))),
         "homology_k": int(split.get("homology_k", config.get("homology_k", 8))),
+        "similarity_policy": str(
+            split.get("similarity_policy", config.get("similarity_policy", "canonical_kmer_jaccard"))
+        ),
         "epochs": int(training.get("epochs", config.get("epochs", 80))),
         "learning_rate": float(training.get("learning_rate", config.get("learning_rate", 1e-3))),
         "ensemble_size": int((config.get("uq") or {}).get("ensemble_size", config.get("ensemble_size", 5))),
         "seed": int(training.get("seed", split.get("seed", config.get("seed", 13)))),
         "acquisition_method": str(acquisition.get("method", config.get("acquisition_method", "upper_confidence_bound"))),
         "beta": float(acquisition.get("beta", config.get("beta", 1.0))),
-        "diversity_method": str(acquisition.get("diversity_method", config.get("diversity_method", "greedy_embedding_cosine"))),
+        "diversity_method": str(acquisition.get("diversity_method", config.get("diversity_method", "kmer_cosine"))),
         "diversity_penalty": float(acquisition.get("diversity_penalty", config.get("diversity_penalty", 0.2))),
         "top_k": int(acquisition.get("top_k", config.get("top_k", generation.get("plate_size", 96)))),
         "generate_candidates": bool(generation.get("enabled", config.get("generate_candidates", False))),
         "num_proposals": int(generation.get("num_proposals", config.get("num_proposals", 1000))),
         "sequence_length": generation.get("sequence_length", config.get("sequence_length", "infer_from_training")),
         "gc_range": generation.get("gc_range", config.get("gc_range")),
-        "evaluation_manifest": manifest.to_dict(),
+        "evaluation_manifest": manifest_dict,
         "manifest_source": "config",
     }
 
@@ -422,6 +648,9 @@ def _prediction_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "test_fraction": args.test_fraction,
         "homology_threshold": args.homology_threshold,
         "homology_k": args.homology_k,
+        "similarity_policy": args.similarity_policy,
+        "similarity_sensitivity_policies": args.similarity_sensitivity_policies or [],
+        "similarity_sensitivity_thresholds": args.similarity_sensitivity_thresholds or [],
         "seed": args.seed,
         "beta": args.beta,
         "diversity_method": args.diversity_method,
@@ -442,6 +671,7 @@ def _prediction_params_from_config(config: dict[str, Any], *, config_dir: Path) 
 
     task_type = str(task.get("type", config.get("task_type", "regression"))).lower()
     manifest = validate_evaluation_manifest(config, task_type=task_type)
+    manifest_dict = _resolve_manifest_paths(manifest.to_dict(), base_dir=config_dir)
 
     assay_files = _as_list(config.get("assay") or config.get("assay_files") or ingestion.get("raw_files"))
     candidate_files = _as_list(config.get("candidate_files") or candidates.get("raw_files"))
@@ -472,12 +702,25 @@ def _prediction_params_from_config(config: dict[str, Any], *, config_dir: Path) 
         "test_fraction": float(split.get("test_fraction", config.get("test_fraction", 0.15))),
         "homology_threshold": float(split.get("homology_threshold", config.get("homology_threshold", 0.90))),
         "homology_k": int(split.get("homology_k", config.get("homology_k", 8))),
+        "similarity_policy": str(
+            split.get("similarity_policy", config.get("similarity_policy", "canonical_kmer_jaccard"))
+        ),
+        "similarity_sensitivity_policies": list(
+            split.get("sensitivity_policies")
+            or config.get("similarity_sensitivity_policies")
+            or []
+        ),
+        "similarity_sensitivity_thresholds": list(
+            split.get("sensitivity_thresholds")
+            or config.get("similarity_sensitivity_thresholds")
+            or []
+        ),
         "seed": int(split.get("seed", config.get("seed", 13))),
         "beta": float(acquisition.get("beta", config.get("beta", 1.0))),
-        "diversity_method": str(acquisition.get("diversity_method", config.get("diversity_method", "greedy_embedding_cosine"))),
+        "diversity_method": str(acquisition.get("diversity_method", config.get("diversity_method", "kmer_cosine"))),
         "diversity_penalty": float(acquisition.get("diversity_penalty", config.get("diversity_penalty", 0.2))),
         "top_k": int(acquisition.get("top_k", config.get("top_k", 96))),
-        "evaluation_manifest": manifest.to_dict(),
+        "evaluation_manifest": manifest_dict,
         "manifest_source": "config",
     }
 
@@ -492,7 +735,7 @@ def _artifact_dir(project: str, output_dir: Path | None) -> Path:
         base.mkdir(parents=True, exist_ok=True)
         out = base / run_token
     else:
-        out = Path("outputs") / "assayready" / safe_project / run_token
+        out = default_output_root() / safe_project / run_token
     out.mkdir(parents=True, exist_ok=False)
     return out.resolve()
 
@@ -503,6 +746,33 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_prospective_artifacts(
+    evaluation_manifest: dict[str, Any],
+    *,
+    assay_files: list[Path],
+) -> list[str]:
+    protocol = evaluation_manifest.get("prospective_protocol")
+    if not protocol:
+        return []
+    protocol = dict(protocol)
+    reasons: list[str] = []
+    selection_path = Path(str(protocol.get("selection_manifest_path") or ""))
+    if not selection_path.is_file():
+        reasons.append("prospective selection manifest is missing")
+    elif _sha256_file(selection_path) != str(protocol.get("selection_manifest_sha256") or "").lower():
+        reasons.append("prospective selection-manifest hash does not match the supplied file")
+    if len(assay_files) != 1:
+        reasons.append("prospective outcome verification currently requires exactly one assay file")
+    elif not Path(assay_files[0]).is_file():
+        reasons.append("prospective outcome data file is missing")
+    elif _sha256_file(Path(assay_files[0])) != str(protocol.get("outcome_data_sha256") or "").lower():
+        reasons.append("prospective outcome-data hash does not match the audited assay file")
+    protocol["artifact_hashes_verified"] = not reasons
+    protocol["verification_reasons"] = reasons
+    evaluation_manifest["prospective_protocol"] = protocol
+    return [f"Prospective assurance withheld: {reason}." for reason in reasons]
 
 
 def _file_records(paths: list[Any]) -> list[dict[str, Any]]:
@@ -542,7 +812,7 @@ def _git_provenance() -> dict[str, Any]:
 
 
 def _dependency_versions() -> dict[str, str]:
-    names = ["model-assessment", "dash", "numpy", "pandas", "scikit-learn", "torch"]
+    names = ["assayready", "dash", "numpy", "pandas", "scikit-learn", "torch"]
     versions: dict[str, str] = {}
     for name in names:
         try:
@@ -610,6 +880,9 @@ def _validate_runtime_params(params: dict[str, Any], *, includes_training: bool)
         raise ValueError("Homology/Jaccard threshold must be between 0 and 1.")
     if int(params.get("homology_k", 8)) < 1:
         raise ValueError("Homology k-mer size must be at least 1.")
+    for threshold in params.get("similarity_sensitivity_thresholds") or []:
+        if not 0.0 <= float(threshold) <= 1.0:
+            raise ValueError("Similarity sensitivity thresholds must be between 0 and 1.")
     if int(params.get("top_k", 96)) < 1:
         raise ValueError("top_k must be at least 1.")
     if float(params.get("beta", 1.0)) < 0.0:
@@ -647,6 +920,7 @@ def verify_cross_split_violations(
     homology_threshold: float,
     homology_k: int,
     group_cols: list[str],
+    similarity_policy: str = "canonical_kmer_jaccard",
 ) -> list[str]:
     violations = []
     if group_cols:
@@ -657,24 +931,26 @@ def verify_cross_split_violations(
             if overlap:
                 violations.append(f"Group overlap detected in '{g_col}': {overlap}")
     
-    # Homology similarity check
+    # Sequence-similarity check under the exact policy used to build the split.
     if homology_threshold > 0 and train_rows and test_rows:
-        train_kmer_sets = [sequence_kmers(row[sequence_col], homology_k) for row in train_rows if row.get(sequence_col)]
         for test_row in test_rows:
             test_seq = test_row.get(sequence_col)
-            if not test_seq:
+            if not test_seq and similarity_policy != "customer_family_labels":
                 continue
-            test_kmers = sequence_kmers(test_seq, homology_k)
-            if not test_kmers:
-                continue
-            for train_kmers in train_kmer_sets:
-                union_size = len(test_kmers.union(train_kmers))
-                if union_size == 0:
-                    continue
-                jaccard = len(test_kmers.intersection(train_kmers)) / union_size
-                if jaccard >= homology_threshold:
+            for train_row in train_rows:
+                similarity = sequence_similarity(
+                    str(test_seq or ""),
+                    str(train_row.get(sequence_col) or ""),
+                    similarity_policy=similarity_policy,
+                    k=homology_k,
+                    left_row=test_row,
+                    right_row=train_row,
+                    group_cols=group_cols,
+                )
+                if similarity >= homology_threshold:
                     violations.append(
-                        f"Homology similarity violation: test sequence has Jaccard similarity {jaccard:.2f} >= threshold {homology_threshold} with train sequence."
+                        f"Similarity-policy violation: {similarity_policy} score {similarity:.2f} "
+                        f">= threshold {homology_threshold} across train/test."
                     )
                     if len(violations) >= 5:
                         violations.append("Additional homology violations omitted...")
@@ -695,9 +971,22 @@ def _bootstrap_metric_ci(
         return None
     metrics = []
     rng = np.random.default_rng(42)
+    clusters: dict[str, list[int]] = {}
+    for idx, row in enumerate(rows):
+        cluster = str(row.get("leakage_cluster") or "").strip()
+        if cluster:
+            clusters.setdefault(cluster, []).append(idx)
+    cluster_groups = list(clusters.values()) if len(clusters) >= 2 else []
     indices = np.arange(len(rows))
     for _ in range(n_resamples):
-        resample_idx = rng.choice(indices, size=len(rows), replace=True)
+        if cluster_groups:
+            selected_groups = rng.choice(len(cluster_groups), size=len(cluster_groups), replace=True)
+            resample_idx = np.asarray(
+                [idx for group_idx in selected_groups for idx in cluster_groups[int(group_idx)]],
+                dtype=np.int64,
+            )
+        else:
+            resample_idx = rng.choice(indices, size=len(rows), replace=True)
         resampled_rows = [rows[idx] for idx in resample_idx]
         try:
             m = _prediction_metrics(
@@ -717,21 +1006,141 @@ def _bootstrap_metric_ci(
     return float(np.percentile(metrics, 2.5)), float(np.percentile(metrics, 97.5))
 
 
-def _lift_ci_from_metric_ci(
-    model_metric_ci: tuple[float, float] | None,
-    baseline_metric: float | None,
-) -> tuple[float, float] | None:
-    """Compare a bootstrapped model interval with a fixed baseline point estimate.
+def _paired_lift_bootstrap(
+    rows: list[dict[str, Any]],
+    *,
+    baseline_predictions: list[float] | None,
+    task_type: str,
+    target_col: str,
+    prediction_col: str,
+    positive_label: str | None,
+    baseline_name: str | None,
+    n_resamples: int = 500,
+    seed: int = 42,
+) -> dict[str, Any]:
+    if not rows or baseline_predictions is None or len(baseline_predictions) != len(rows):
+        return {
+            "status": "unavailable",
+            "reason": "aligned per-row predictions for the selected baseline are unavailable",
+            "interval": None,
+            "baseline_name": baseline_name,
+        }
+    paired_rows = []
+    for row, baseline_prediction in zip(rows, baseline_predictions):
+        paired = dict(row)
+        paired["__baseline_prediction"] = float(baseline_prediction)
+        paired_rows.append(paired)
 
-    This is intentionally not described as a paired lift interval: generating a
-    paired interval requires per-row baseline predictions, which the current
-    baseline API does not expose.
-    """
-    if model_metric_ci is None or baseline_metric is None:
-        return None
-    return (
-        float(model_metric_ci[0]) - float(baseline_metric),
-        float(model_metric_ci[1]) - float(baseline_metric),
+    cluster_map: dict[str, list[int]] = {}
+    for idx, row in enumerate(paired_rows):
+        cluster = str(row.get("leakage_cluster") or "").strip()
+        if cluster:
+            cluster_map.setdefault(cluster, []).append(idx)
+    cluster_groups = list(cluster_map.values()) if len(cluster_map) >= 2 else []
+    bootstrap_unit = "leakage_cluster" if cluster_groups else "row"
+    rng = np.random.default_rng(seed)
+    all_indices = np.arange(len(paired_rows))
+    deltas: list[float] = []
+    for _ in range(int(n_resamples)):
+        if cluster_groups:
+            selected_groups = rng.choice(len(cluster_groups), size=len(cluster_groups), replace=True)
+            sampled_indices = [
+                idx for group_idx in selected_groups for idx in cluster_groups[int(group_idx)]
+            ]
+        else:
+            sampled_indices = rng.choice(all_indices, size=len(paired_rows), replace=True).tolist()
+        sampled = [paired_rows[int(idx)] for idx in sampled_indices]
+        try:
+            model_metrics = _prediction_metrics(
+                sampled,
+                task_type=task_type,
+                target_col=target_col,
+                prediction_col=prediction_col,
+                positive_label=positive_label,
+            )
+            baseline_metrics = _prediction_metrics(
+                sampled,
+                task_type=task_type,
+                target_col=target_col,
+                prediction_col="__baseline_prediction",
+                positive_label=positive_label,
+            )
+        except Exception:
+            continue
+        model_value = _safe_float(model_metrics.get("primary_metric"))
+        baseline_value = _safe_float(baseline_metrics.get("primary_metric"))
+        if model_value is not None and baseline_value is not None:
+            deltas.append(model_value - baseline_value)
+    if not deltas:
+        return {
+            "status": "unavailable",
+            "reason": "no bootstrap resample produced paired model and baseline metrics",
+            "interval": None,
+            "baseline_name": baseline_name,
+            "bootstrap_unit": bootstrap_unit,
+            "valid_resamples": 0,
+        }
+    interval = [float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5))]
+    return {
+        "status": "ok",
+        "method": "paired_bootstrap_model_minus_baseline",
+        "interval": interval,
+        "baseline_name": baseline_name,
+        "bootstrap_unit": bootstrap_unit,
+        "seed": int(seed),
+        "requested_resamples": int(n_resamples),
+        "valid_resamples": len(deltas),
+    }
+
+
+def _pop_baseline_predictions(
+    baselines: dict[str, dict[str, Any]],
+    *,
+    best_name: str | None,
+) -> list[float] | None:
+    selected: list[float] | None = None
+    for name, metrics in baselines.items():
+        predictions = metrics.pop("test_predictions", None)
+        if name == best_name and predictions is not None:
+            selected = [float(value) for value in predictions]
+    return selected
+
+
+def _write_baseline_comparison(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    baseline_predictions: list[float] | None,
+    baseline_name: str | None,
+    target_col: str,
+    prediction_col: str,
+) -> None:
+    comparison_rows: list[dict[str, Any]] = []
+    if baseline_predictions is not None and len(baseline_predictions) == len(rows):
+        for index, (row, baseline_prediction) in enumerate(zip(rows, baseline_predictions)):
+            comparison_rows.append(
+                {
+                    "row_index": index,
+                    "sequence_hash": row.get("sequence_hash", ""),
+                    "leakage_cluster": row.get("leakage_cluster", ""),
+                    "target": row.get(target_col),
+                    "model_prediction": row.get(prediction_col),
+                    "baseline_name": baseline_name,
+                    "baseline_prediction": float(baseline_prediction),
+                }
+            )
+    write_table(
+        path,
+        comparison_rows,
+        fieldnames=[
+            "row_index",
+            "sequence_hash",
+            "leakage_cluster",
+            "target",
+            "model_prediction",
+            "baseline_name",
+            "baseline_prediction",
+        ],
     )
 
 
@@ -759,7 +1168,13 @@ def _claim_gate(
 
     split_sizes = split_diagnostics.get("split_sizes") or {}
     test_rows = _as_int_default(split_sizes.get("test"), 0)
-    num_clusters = _as_int_default(split_diagnostics.get("num_clusters"), 0)
+    split_cluster_counts = split_diagnostics.get("split_cluster_counts") or {}
+    # Scientific gates depend on independent units represented in the held-out
+    # set, not on clusters that exist only in training or validation data.
+    num_clusters = _as_int_default(
+        split_cluster_counts.get("test"),
+        _as_int_default(split_diagnostics.get("num_clusters"), 0),
+    )
     severe_warning = any("DO NOT TRUST" in str(item) for item in warnings)
     training_independence = str(evaluation_manifest.get("training_independence") or "unverified").lower()
 
@@ -836,20 +1251,20 @@ def _claim_gate(
     constraints_verified = bool(evaluation_manifest.get("constraints_verified", False))
     constraint_reasons = [] if constraints_verified else ["candidate biological/synthesis constraints were not verified"]
 
-    recommendation_reasons: list[str] = []
+    prioritization_reasons: list[str] = []
     if ranked_candidates <= 0:
-        recommendation_reasons.append("no ranked candidates were produced")
+        prioritization_reasons.append("no candidate-prioritization rows were produced")
     if severe_warning:
-        recommendation_reasons.append("severe warning present")
+        prioritization_reasons.append("severe warning present")
     if not leakage_ok:
-        recommendation_reasons.append("leakage gate failed")
+        prioritization_reasons.append("leakage check did not meet the selected policy")
     if not lift_ok:
-        recommendation_reasons.append("lift gate failed")
+        prioritization_reasons.append("lift check did not meet the selected policy")
     if uncertainty_type != "none" and not calibration_ok:
-        recommendation_reasons.append("uncertainty usability gate failed")
+        prioritization_reasons.append("uncertainty usability check did not meet the selected policy")
     if constraint_reasons:
-        recommendation_reasons.append("candidate constraint gate failed")
-    recommendation_ok = not recommendation_reasons
+        prioritization_reasons.append("candidate constraints were not verified")
+    prioritization_ok = not prioritization_reasons
 
     return {
         "thresholds": {
@@ -870,8 +1285,327 @@ def _claim_gate(
         "uncertainty_usable": {"ok": calibration_ok, "reasons": calibration_reasons},
         "calibrated_uncertainty": {"ok": calibration_ok, "reasons": calibration_reasons},
         "candidate_constraints": {"ok": constraints_verified, "reasons": constraint_reasons},
-        "recommended": {"ok": recommendation_ok, "reasons": recommendation_reasons},
+        "candidate_prioritization": {
+            "ok": prioritization_ok,
+            "status": "eligible_for_scientist_review" if prioritization_ok else "review_with_cautions",
+            "reasons": prioritization_reasons,
+        },
+        "threshold_policy": dict(evaluation_manifest.get("threshold_policy") or {}),
     }
+
+
+ASSURANCE_LEVELS = {
+    "self_declared": "Self-declared audit",
+    "provenance_verified": "Provenance-verified audit",
+    "controlled_evaluation": "Controlled evaluation",
+    "prospective_evaluation": "Prospective evaluation",
+}
+
+EVIDENCE_LEVELS = {
+    "insufficient_evidence": "Insufficient evidence",
+    "descriptive_audit_only": "Descriptive audit only",
+    "retrospectively_credible": "Retrospectively credible",
+    "locked_holdout_credible": "Locked-holdout credible",
+    "prospectively_demonstrated": "Prospectively demonstrated",
+}
+
+
+def _provenance_hashes_complete(evaluation_manifest: dict[str, Any]) -> bool:
+    provenance = evaluation_manifest.get("provenance") or {}
+    return all(
+        bool(str(provenance.get(field) or "").strip())
+        for field in ["training_data_sha256", "model_sha256", "split_sha256", "code_sha256"]
+    )
+
+
+def _derive_assurance_level(
+    evaluation_manifest: dict[str, Any],
+    *,
+    external_predictions: bool,
+) -> dict[str, Any]:
+    prospective_protocol = evaluation_manifest.get("prospective_protocol")
+    hashes_complete = _provenance_hashes_complete(evaluation_manifest)
+    training_independence = str(evaluation_manifest.get("training_independence") or "unverified").lower()
+    artifact_verification = str(
+        (evaluation_manifest.get("provenance") or {}).get("artifact_verification") or ""
+    ).strip().lower()
+    controlled_execution_declared = artifact_verification.startswith(
+        "controlled_execution_manifest_sha256:"
+    )
+    basis: list[str] = []
+    limitations: list[str] = []
+
+    if (
+        external_predictions
+        and prospective_protocol
+        and bool(prospective_protocol.get("artifact_hashes_verified"))
+    ):
+        key = "prospective_evaluation"
+        basis.extend(
+            [
+                "candidate selection timestamp precedes the measurement timestamp",
+                "selection-manifest and outcome-data hashes were supplied",
+            ]
+        )
+        if not hashes_complete:
+            limitations.append("model, training-data, split, and code hashes are not all present")
+    elif not external_predictions:
+        key = "controlled_evaluation"
+        basis.append("AssayReady created the split, fitted the task head, and evaluated it in this execution")
+        limitations.append("the evaluation remains retrospective unless a prospective protocol is supplied")
+    elif hashes_complete:
+        key = "provenance_verified"
+        basis.append("training-data, split, model, and code SHA-256 identifiers were supplied and format-checked")
+        if controlled_execution_declared:
+            basis.append("a controlled-execution manifest SHA-256 identifier was supplied")
+        if training_independence != "verified_holdout":
+            limitations.append("the supplied provenance does not declare a verified locked holdout")
+    else:
+        key = "self_declared"
+        basis.append("the audit relies on customer-supplied predictions and provenance statements")
+        limitations.append("independence from model training data was not independently verified")
+
+    if prospective_protocol and not bool(prospective_protocol.get("artifact_hashes_verified")):
+        limitations.append(
+            "a prospective protocol was supplied, but its selection/outcome artifacts were not verified"
+        )
+    if prospective_protocol and not external_predictions:
+        limitations.append(
+            "the internal training workflow cannot establish that model-based selection preceded these outcomes"
+        )
+    if external_predictions and key != "prospective_evaluation" and not controlled_execution_declared:
+        limitations.append("AssayReady did not execute the external model against a locked test set")
+    if key != "prospective_evaluation":
+        limitations.append("prospective biological utility has not been demonstrated")
+    return {
+        "key": key,
+        "label": ASSURANCE_LEVELS[key],
+        "basis": basis,
+        "limitations": list(dict.fromkeys(limitations)),
+    }
+
+
+def _threshold_profiles(thresholds: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    declared = {
+        "min_test_rows": _as_int_default(thresholds.get("min_test_rows"), 20),
+        "min_num_clusters": _as_int_default(thresholds.get("min_num_clusters"), 3),
+        "min_lift_delta": _as_float_default(thresholds.get("min_lift_delta"), 0.0),
+        "min_uncertainty_spearman": _as_float_default(thresholds.get("min_uncertainty_spearman"), 0.20),
+        "max_calibration_gap_ratio": _as_float_default(thresholds.get("max_calibration_gap_ratio"), 1.0),
+    }
+    stricter = {
+        "min_test_rows": max(declared["min_test_rows"], 50),
+        "min_num_clusters": max(declared["min_num_clusters"], 5),
+        "min_lift_delta": max(declared["min_lift_delta"], 0.05),
+        "min_uncertainty_spearman": max(declared["min_uncertainty_spearman"], 0.30),
+        "max_calibration_gap_ratio": min(declared["max_calibration_gap_ratio"], 0.75),
+    }
+    stringent = {
+        "min_test_rows": max(declared["min_test_rows"], 100),
+        "min_num_clusters": max(declared["min_num_clusters"], 10),
+        "min_lift_delta": max(declared["min_lift_delta"], 0.10),
+        "min_uncertainty_spearman": max(declared["min_uncertainty_spearman"], 0.50),
+        "max_calibration_gap_ratio": min(declared["max_calibration_gap_ratio"], 0.50),
+    }
+    return [("declared", declared), ("stricter", stricter), ("stringent", stringent)]
+
+
+def _threshold_sensitivity_analysis(
+    *,
+    task_type: str,
+    split_diagnostics: dict[str, Any],
+    warnings: list[str],
+    best_baseline_metric: float | None,
+    model_metric: float | None,
+    uncertainty_audit: dict[str, Any] | None,
+    ranked_candidates: int,
+    evaluation_manifest: dict[str, Any],
+    cross_split_violations: list[str] | None,
+    model_metric_ci: tuple[float, float] | None,
+    lift_delta_ci: tuple[float, float] | None,
+    external_predictions: bool,
+) -> dict[str, Any]:
+    profiles: list[dict[str, Any]] = []
+    for name, thresholds in _threshold_profiles(dict(evaluation_manifest.get("claim_thresholds") or {})):
+        manifest = dict(evaluation_manifest)
+        manifest["claim_thresholds"] = thresholds
+        checks = _claim_gate(
+            task_type=task_type,
+            split_diagnostics=split_diagnostics,
+            warnings=warnings,
+            best_baseline_metric=best_baseline_metric,
+            model_metric=model_metric,
+            uncertainty_audit=uncertainty_audit,
+            ranked_candidates=ranked_candidates,
+            evaluation_manifest=manifest,
+            cross_split_violations=cross_split_violations,
+            model_metric_ci=model_metric_ci,
+            lift_delta_ci=lift_delta_ci,
+            external_predictions=external_predictions,
+        )
+        criteria_met = bool(checks["leakage_controlled"]["ok"] and checks["lift_claim"]["ok"])
+        profiles.append(
+            {
+                "name": name,
+                "thresholds": thresholds,
+                "retrospective_criteria_met": criteria_met,
+                "failed_checks": {
+                    key: list(checks[key].get("reasons") or [])
+                    for key in ["leakage_controlled", "lift_claim", "uncertainty_usable"]
+                    if not checks[key].get("ok")
+                },
+            }
+        )
+    declared_result = bool(profiles[0]["retrospective_criteria_met"])
+    conclusion_changes = any(
+        bool(profile["retrospective_criteria_met"]) != declared_result for profile in profiles[1:]
+    )
+    return {
+        "profiles": profiles,
+        "conclusion_changes_under_stricter_thresholds": conclusion_changes,
+        "stable_under_stricter_thresholds": declared_result and not conclusion_changes,
+        "interpretation": (
+            "These generic profiles are a robustness diagnostic, not assay-specific biological standards."
+        ),
+    }
+
+
+def _derive_evidence_level(
+    *,
+    claim_gate: dict[str, Any],
+    assurance_level: dict[str, Any],
+    threshold_sensitivity: dict[str, Any],
+    metric: float | None,
+    evaluation_manifest: dict[str, Any],
+    similarity_sensitivity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    support: list[str] = []
+    limitations = list(assurance_level.get("limitations") or [])
+    leakage_ok = bool((claim_gate.get("leakage_controlled") or {}).get("ok"))
+    lift_ok = bool((claim_gate.get("lift_claim") or {}).get("ok"))
+    threshold_stable = bool(threshold_sensitivity.get("stable_under_stricter_thresholds"))
+    similarity_changes = bool(
+        (similarity_sensitivity or {}).get("conclusion_changes_across_similarity_settings")
+    )
+    similarity_status = str((similarity_sensitivity or {}).get("status") or "").lower()
+    assurance_key = str(assurance_level.get("key") or "self_declared")
+    training_independence = str(evaluation_manifest.get("training_independence") or "unverified").lower()
+
+    if metric is None:
+        key = "insufficient_evidence"
+        limitations.append("no usable held-out primary metric was produced")
+    elif not leakage_ok or not lift_ok:
+        key = "descriptive_audit_only"
+        limitations.append("one or more retrospective leakage/lift checks did not meet the selected policy")
+    elif not threshold_stable or similarity_changes or similarity_status in {
+        "not_evaluated",
+        "not_evaluable",
+        "insufficient_alternatives",
+    }:
+        key = "descriptive_audit_only"
+        if similarity_status in {"not_evaluated", "not_evaluable", "insufficient_alternatives"}:
+            limitations.append("conclusion sensitivity to alternate similarity settings was not evaluated")
+        else:
+            limitations.append("the conclusion is sensitive to stricter thresholds or similarity settings")
+    elif assurance_key == "prospective_evaluation":
+        key = "prospectively_demonstrated"
+        support.append("performance was measured after a hashed, timestamped candidate selection")
+    elif assurance_key == "provenance_verified" and training_independence == "verified_holdout":
+        key = "locked_holdout_credible"
+        support.append("the locked-holdout declaration and complete provenance hashes cap this at holdout evidence")
+    elif assurance_key == "controlled_evaluation":
+        key = "retrospectively_credible"
+        support.append("AssayReady controlled model fitting, splitting, and retrospective evaluation")
+    else:
+        key = "descriptive_audit_only"
+        limitations.append("self-declared or incomplete provenance caps the result at descriptive evidence")
+
+    if leakage_ok:
+        support.append("the selected leakage checks met their declared thresholds")
+    if lift_ok:
+        support.append("the model beat the tested simple baselines under the declared lift policy")
+    if threshold_stable:
+        support.append("the conclusion did not change under the included stricter threshold profiles")
+    if assurance_key != "prospective_evaluation":
+        limitations.append("retrospective performance does not establish wet-lab value")
+    return {
+        "key": key,
+        "label": EVIDENCE_LEVELS[key],
+        "support": list(dict.fromkeys(support)),
+        "limitations": list(dict.fromkeys(limitations)),
+    }
+
+
+def _evaluate_report_evidence(
+    *,
+    task_type: str,
+    split_diagnostics: dict[str, Any],
+    warnings: list[str],
+    best_baseline_metric: float | None,
+    model_metric: float | None,
+    uncertainty_audit: dict[str, Any] | None,
+    ranked_candidates: int,
+    evaluation_manifest: dict[str, Any],
+    cross_split_violations: list[str] | None,
+    model_metric_ci: tuple[float, float] | None,
+    lift_delta_ci: tuple[float, float] | None,
+    external_predictions: bool,
+    similarity_sensitivity: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    checks = _claim_gate(
+        task_type=task_type,
+        split_diagnostics=split_diagnostics,
+        warnings=warnings,
+        best_baseline_metric=best_baseline_metric,
+        model_metric=model_metric,
+        uncertainty_audit=uncertainty_audit,
+        ranked_candidates=ranked_candidates,
+        evaluation_manifest=evaluation_manifest,
+        cross_split_violations=cross_split_violations,
+        model_metric_ci=model_metric_ci,
+        lift_delta_ci=lift_delta_ci,
+        external_predictions=external_predictions,
+    )
+    threshold_sensitivity = _threshold_sensitivity_analysis(
+        task_type=task_type,
+        split_diagnostics=split_diagnostics,
+        warnings=warnings,
+        best_baseline_metric=best_baseline_metric,
+        model_metric=model_metric,
+        uncertainty_audit=uncertainty_audit,
+        ranked_candidates=ranked_candidates,
+        evaluation_manifest=evaluation_manifest,
+        cross_split_violations=cross_split_violations,
+        model_metric_ci=model_metric_ci,
+        lift_delta_ci=lift_delta_ci,
+        external_predictions=external_predictions,
+    )
+    assurance = _derive_assurance_level(
+        evaluation_manifest,
+        external_predictions=external_predictions,
+    )
+    evidence = _derive_evidence_level(
+        claim_gate=checks,
+        assurance_level=assurance,
+        threshold_sensitivity=threshold_sensitivity,
+        metric=model_metric,
+        evaluation_manifest=evaluation_manifest,
+        similarity_sensitivity=similarity_sensitivity,
+    )
+    return checks, threshold_sensitivity, assurance, evidence
+
+
+def _evidence_verdict(evidence_level: dict[str, Any], assurance_level: dict[str, Any]) -> str:
+    label = str(evidence_level.get("label") or EVIDENCE_LEVELS["insufficient_evidence"])
+    assurance = str(assurance_level.get("label") or ASSURANCE_LEVELS["self_declared"])
+    support = list(evidence_level.get("support") or [])
+    limitations = list(evidence_level.get("limitations") or [])
+    sentences = [f"{label} ({assurance})."]
+    if support:
+        sentences.append(str(support[0]).rstrip(".") + ".")
+    if limitations:
+        sentences.append(" ".join(str(item).rstrip(".") + "." for item in limitations[:2]))
+    return " ".join(sentences)
 
 
 def _metric_lines(metrics: dict[str, Any]) -> list[str]:
@@ -885,13 +1619,47 @@ def _metric_lines(metrics: dict[str, Any]) -> list[str]:
     return lines or ["- No metrics available."]
 
 
+def _similarity_sensitivity_markdown_lines(report: dict[str, Any]) -> list[str]:
+    sensitivity = report.get("similarity_sensitivity") or {}
+    lines = ["## Similarity Sensitivity", ""]
+    if not sensitivity:
+        return [*lines, "No similarity sensitivity analysis was available.", ""]
+    lines.append(str(sensitivity.get("interpretation") or sensitivity.get("reason") or ""))
+    lines.extend(
+        [
+            "",
+            f"- Test membership changes across settings: "
+            f"{sensitivity.get('test_membership_changes_across_similarity_settings')}",
+            f"- Conclusion changes across settings: "
+            f"{sensitivity.get('conclusion_changes_across_similarity_settings')}",
+        ]
+    )
+    for setting in sensitivity.get("settings") or []:
+        lines.append(
+            f"- policy={setting.get('similarity_policy_requested')}; "
+            f"threshold={setting.get('similarity_threshold')}; "
+            f"clusters={setting.get('num_clusters')}; metric={setting.get('model_metric')}; "
+            f"retrospective_criteria_met={setting.get('retrospective_criteria_met')}"
+        )
+    for setting in sensitivity.get("skipped_settings") or []:
+        lines.append(
+            f"- skipped policy={setting.get('similarity_policy')}; "
+            f"threshold={setting.get('similarity_threshold')}: {setting.get('reason')}"
+        )
+    lines.append("")
+    return lines
+
+
 def _benchmark_markdown(report: dict[str, Any]) -> str:
     claim_gate = report.get("claim_gate") or {}
     leakage_ok = (claim_gate.get("leakage_controlled") or {}).get("ok")
     lift_ok = (claim_gate.get("lift_claim") or {}).get("ok")
     calibration_ok = (claim_gate.get("uncertainty_usable") or {}).get("ok")
-    recommended_ok = (claim_gate.get("recommended") or {}).get("ok")
+    prioritization = claim_gate.get("candidate_prioritization") or {}
     manifest = report.get("evaluation_manifest") or {}
+    assurance = report.get("assurance_level") or {}
+    evidence = report.get("evidence_level") or {}
+    sensitivity = report.get("threshold_sensitivity") or {}
     lines = [
         f"# AssayReady Benchmark: {report['project']}",
         "",
@@ -901,7 +1669,10 @@ def _benchmark_markdown(report: dict[str, Any]) -> str:
         f"- Primary metric: {report['primary_metric_name']}",
         f"- Best simple baseline: {report['best_simple_baseline']}",
         f"- Task-head primary metric: {report.get('task_head_primary_metric')}",
+        f"- Lift interval: {report.get('lift_interval')}",
         f"- Verdict: {report['verdict']}",
+        f"- Assurance source: {assurance.get('label')}",
+        f"- Evidence level: {evidence.get('label')}",
         "",
         "## Evaluation Manifest",
         "",
@@ -913,15 +1684,39 @@ def _benchmark_markdown(report: dict[str, Any]) -> str:
         f"- Candidate constraints verified: {manifest.get('constraints_verified')}",
         f"- Positive label: {manifest.get('positive_label')}",
         f"- Biological constraints: {manifest.get('biological_constraints')}",
+        f"- Threshold policy: {(manifest.get('threshold_policy') or {}).get('policy_name')}",
+        f"- Threshold source: {(manifest.get('threshold_policy') or {}).get('source')}",
         "",
-        "## Claim Gate",
+        "## Evidence Basis and Limitations",
         "",
-        f"- leakage_controlled: {leakage_ok}",
-        f"- lift_claim: {lift_ok}",
-        f"- uncertainty_usable: {calibration_ok}",
-        f"- recommended: {recommended_ok}",
+        *[f"- Supporting evidence: {item}" for item in evidence.get("support") or []],
+        *[f"- Limitation: {item}" for item in evidence.get("limitations") or []],
+        "",
+        "## Policy Checks",
+        "",
+        f"- Leakage policy supported: {leakage_ok}",
+        f"- Lift policy supported: {lift_ok}",
+        f"- Uncertainty policy supported: {calibration_ok}",
+        f"- Candidate-prioritization status: {prioritization.get('status')}",
+        "",
+        "## Threshold Sensitivity",
+        "",
+        str(sensitivity.get("interpretation") or "No threshold sensitivity analysis was available."),
         "",
     ]
+    for profile in sensitivity.get("profiles") or []:
+        lines.append(
+            f"- {profile.get('name')}: retrospective_criteria_met="
+            f"{profile.get('retrospective_criteria_met')}; thresholds={profile.get('thresholds')}"
+        )
+    lines.extend(
+        [
+            f"- Conclusion changes under stricter thresholds: "
+            f"{sensitivity.get('conclusion_changes_under_stricter_thresholds')}",
+            "",
+        ]
+    )
+    lines.extend(_similarity_sensitivity_markdown_lines(report))
     warnings = report.get("warnings") or []
     if warnings:
         lines.extend(["## Warnings", ""])
@@ -962,14 +1757,15 @@ def _readiness_markdown(summary: dict[str, Any]) -> str:
         "",
         f"- Primary metric: {report.get('primary_metric_name')}",
         f"- Best simple baseline: {report.get('best_simple_baseline')}",
+        f"- Paired lift interval: {report.get('lift_interval')}",
         f"- Task-head metric: {report.get('task_head_primary_metric')}",
         "",
-        "## Next Experiment",
+        "## Candidate Prioritization",
         "",
-        f"- Ranked candidate rows: {summary.get('ranked_candidates', 0)}",
+        f"- Candidate-prioritization rows: {summary.get('ranked_candidates', 0)}",
         f"- Generated candidate rows: {summary.get('generated_candidates', 0)}",
         "- Candidate explanations include nearest training examples, training-distribution status, and risk flags.",
-        "- Treat all ranked designs as in-silico hypotheses until wet-lab validated.",
+        "- This is not an approved plate design; all rows require scientist review and wet-lab validation.",
         "",
         "## Artifacts",
         "",
@@ -991,7 +1787,7 @@ def _model_card_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Intended Use",
         "",
-        "- Local assay audit and candidate ranking for computational biology teams.",
+        "- Local assay audit and candidate prioritization for computational biology teams.",
         "- Exploratory assay-data and retrospective model audit with candidate prioritization.",
         "- Not intended for clinical, diagnostic, therapeutic, or environmental release decisions.",
         "- Not intended for patient-specific clinical decision support or regulated medical-device claims.",
@@ -1008,7 +1804,8 @@ def _model_card_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Validation Policy",
         "",
-        "- Train/validation/test splits use declared groups and canonical k-mer Jaccard clustering.",
+        f"- Train/validation/test splits use declared groups and the named similarity policy: "
+        f"{params.get('similarity_policy', 'canonical_kmer_jaccard')}.",
         "- Simple GC/length and k-mer baselines are reported before model lift is trusted.",
         "- Low-N, split-quality, and cross-split violations produce explicit warnings and block claims.",
         "",
@@ -1149,6 +1946,248 @@ def _prediction_metrics(
     }
 
 
+def _similarity_sensitivity_analysis(
+    rows: list[dict[str, Any]],
+    *,
+    task_type: str,
+    sequence_col: str,
+    target_col: str,
+    prediction_col: str,
+    positive_label: str | None,
+    group_cols: list[str],
+    val_fraction: float,
+    test_fraction: float,
+    selected_policy: str,
+    selected_threshold: float,
+    homology_k: int,
+    seed: int,
+    evaluation_manifest: dict[str, Any],
+    warnings: list[str],
+    configured_policies: list[str] | None = None,
+    configured_thresholds: list[float] | None = None,
+) -> dict[str, Any]:
+    default_policies = [
+        selected_policy,
+        "exact_reverse_complement",
+        "edit_distance",
+        "position_aware_motif",
+    ]
+    if group_cols:
+        default_policies.append("customer_family_labels")
+    policies = [str(item) for item in (configured_policies or default_policies)]
+    if selected_policy not in policies:
+        policies.insert(0, selected_policy)
+    raw_thresholds = configured_thresholds or [
+        max(0.0, float(selected_threshold) - 0.10),
+        float(selected_threshold),
+        min(1.0, float(selected_threshold) + 0.05),
+    ]
+    thresholds = list(dict.fromkeys(round(float(item), 8) for item in raw_thresholds))
+    if float(selected_threshold) not in thresholds:
+        thresholds.append(float(selected_threshold))
+    scenarios: list[tuple[str, float]] = [(selected_policy, float(selected_threshold))]
+    scenarios.extend((selected_policy, threshold) for threshold in thresholds)
+    scenarios.extend((policy, float(selected_threshold)) for policy in policies)
+    scenarios = list(dict.fromkeys(scenarios))
+
+    settings: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for policy, threshold in scenarios:
+        resolved_policy = "canonical_kmer_jaccard" if policy in {"kmer_jaccard", "minhash_kmer"} else policy
+        if len(rows) > 250 and resolved_policy == "edit_distance":
+            skipped.append(
+                {
+                    "similarity_policy": policy,
+                    "similarity_threshold": threshold,
+                    "reason": (
+                        "edit-distance sensitivity is capped at 250 rows because exhaustive pairwise "
+                        "dynamic programming is computationally expensive; configure a smaller audit subset"
+                    ),
+                }
+            )
+            continue
+        if len(rows) > 1000 and resolved_policy not in {
+            selected_policy,
+            "canonical_kmer_jaccard",
+            "customer_family_labels",
+        }:
+            skipped.append(
+                {
+                    "similarity_policy": policy,
+                    "similarity_threshold": threshold,
+                    "reason": "quadratic policy sensitivity is capped at 1,000 rows",
+                }
+            )
+            continue
+        try:
+            scenario_splits, diagnostics = leakage_safe_split(
+                rows,
+                sequence_col=sequence_col,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
+                group_cols=group_cols,
+                homology_threshold=threshold,
+                homology_k=homology_k,
+                similarity_policy=policy,
+                seed=seed,
+            )
+            scenario_baselines = run_baselines(
+                scenario_splits["train"],
+                scenario_splits["test"],
+                task_type=task_type,
+                sequence_col=sequence_col,
+                target_col=target_col,
+                seed=seed,
+                positive_label=positive_label,
+                include_predictions=True,
+            )
+            best_name, best_value = best_simple_baseline(scenario_baselines, task_type)
+            baseline_predictions = _pop_baseline_predictions(scenario_baselines, best_name=best_name)
+            metrics = _prediction_metrics(
+                scenario_splits["test"],
+                task_type=task_type,
+                target_col=target_col,
+                prediction_col=prediction_col,
+                positive_label=positive_label,
+            )
+            model_metric = _safe_float(metrics.get("primary_metric"))
+            model_ci = _bootstrap_metric_ci(
+                scenario_splits["test"],
+                task_type=task_type,
+                target_col=target_col,
+                prediction_col=prediction_col,
+                positive_label=positive_label,
+                n_resamples=100,
+            )
+            paired_lift = _paired_lift_bootstrap(
+                scenario_splits["test"],
+                baseline_predictions=baseline_predictions,
+                task_type=task_type,
+                target_col=target_col,
+                prediction_col=prediction_col,
+                positive_label=positive_label,
+                baseline_name=best_name,
+                n_resamples=150,
+                seed=seed,
+            )
+            lift_interval = tuple(paired_lift["interval"]) if paired_lift.get("interval") else None
+            violations = verify_cross_split_violations(
+                scenario_splits["train"],
+                scenario_splits["test"],
+                sequence_col=sequence_col,
+                homology_threshold=threshold,
+                homology_k=homology_k,
+                group_cols=group_cols,
+                similarity_policy=policy,
+            )
+            sensitivity_manifest = dict(evaluation_manifest)
+            sensitivity_manifest["training_independence"] = "internally_controlled"
+            checks = _claim_gate(
+                task_type=task_type,
+                split_diagnostics=diagnostics,
+                warnings=list(warnings) + list(diagnostics.get("warnings") or []),
+                best_baseline_metric=best_value,
+                model_metric=model_metric,
+                uncertainty_audit=None,
+                ranked_candidates=0,
+                evaluation_manifest=sensitivity_manifest,
+                cross_split_violations=violations,
+                model_metric_ci=model_ci,
+                lift_delta_ci=lift_interval,
+                external_predictions=False,
+            )
+            criteria_met = bool(
+                checks["leakage_controlled"]["ok"] and checks["lift_claim"]["ok"]
+            )
+            test_members = sorted(
+                str(row.get("sequence_hash") or stable_sequence_hash(row.get(sequence_col, "")))
+                for row in scenario_splits["test"]
+            )
+            settings.append(
+                {
+                    "similarity_policy": diagnostics.get("similarity_policy", policy),
+                    "similarity_policy_requested": policy,
+                    "similarity_threshold": threshold,
+                    "num_clusters": diagnostics.get("num_clusters"),
+                    "test_clusters": (diagnostics.get("split_cluster_counts") or {}).get("test"),
+                    "split_sizes": diagnostics.get("split_sizes"),
+                    "test_membership_sha256": hashlib.sha256(
+                        "\n".join(test_members).encode("utf-8")
+                    ).hexdigest(),
+                    "model_metric": model_metric,
+                    "best_baseline": {"name": best_name, "primary_metric": best_value},
+                    "paired_lift_interval": paired_lift,
+                    "retrospective_criteria_met": criteria_met,
+                    "failed_checks": {
+                        key: list(checks[key].get("reasons") or [])
+                        for key in ["leakage_controlled", "lift_claim"]
+                        if not checks[key].get("ok")
+                    },
+                }
+            )
+        except Exception as exc:
+            settings.append(
+                {
+                    "similarity_policy_requested": policy,
+                    "similarity_threshold": threshold,
+                    "status": "not_evaluable",
+                    "reason": str(exc),
+                    "retrospective_criteria_met": None,
+                }
+            )
+
+    reference = next(
+        (
+            setting
+            for setting in settings
+            if setting.get("similarity_policy_requested") == selected_policy
+            and float(setting.get("similarity_threshold", -1)) == float(selected_threshold)
+        ),
+        settings[0] if settings else {},
+    )
+    reference_result = reference.get("retrospective_criteria_met")
+    reference_membership = reference.get("test_membership_sha256")
+    evaluable_alternatives = [
+        setting
+        for setting in settings
+        if setting is not reference and setting.get("retrospective_criteria_met") is not None
+    ]
+    conclusion_changes = any(
+        setting.get("retrospective_criteria_met") != reference_result
+        for setting in evaluable_alternatives
+    )
+    membership_changes = any(
+        setting.get("test_membership_sha256") != reference_membership
+        for setting in evaluable_alternatives
+    )
+    sensitivity_status = (
+        "evaluated"
+        if reference_result is not None and evaluable_alternatives
+        else "insufficient_alternatives"
+    )
+    return {
+        "status": sensitivity_status,
+        "reference": {
+            "similarity_policy": selected_policy,
+            "similarity_threshold": float(selected_threshold),
+        },
+        "settings": settings,
+        "skipped_settings": skipped,
+        "test_membership_changes_across_similarity_settings": membership_changes,
+        "conclusion_changes_across_similarity_settings": conclusion_changes,
+        "reason": (
+            None
+            if sensitivity_status == "evaluated"
+            else "A reference result and at least one evaluable alternate similarity setting are required."
+        ),
+        "interpretation": (
+            "Each setting rebuilds the split, refits simple baselines, and recomputes paired model lift. "
+            "The comparison isolates technical split/lift sensitivity from the separate provenance cap. "
+            "These sequence policies remain proxies for assay-specific biological relatedness."
+        ),
+    }
+
+
 def _uncertainty_audit(
     rows: list[dict[str, Any]],
     *,
@@ -1165,10 +2204,10 @@ def _uncertainty_audit(
     usable_uncertainty: list[float] = []
     for row in rows:
         uncertainty = _safe_float(row.get(uncertainty_col))
-        if uncertainty is None:
+        if uncertainty is None or uncertainty < 0:
             continue
         usable_rows.append(row)
-        usable_uncertainty.append(float(max(0.0, uncertainty)))
+        usable_uncertainty.append(float(uncertainty))
     if len(usable_rows) < 3:
         return {"status": "skipped", "reason": "fewer than 3 rows have valid uncertainty values", "num_rows": len(usable_rows)}
 
@@ -1220,6 +2259,7 @@ def _ranking_audit(
     prediction_col: str,
     top_k: int,
     positive_label: str | None,
+    objective_direction: str = "maximize",
 ) -> dict[str, Any]:
     if not rows:
         return {"status": "skipped", "reason": "no rows with valid predictions"}
@@ -1234,9 +2274,10 @@ def _ranking_audit(
         y_true = np.asarray([float(row[target_col]) for row in rows], dtype=np.float64)
         y_pred = np.asarray([float(row[prediction_col]) for row in rows], dtype=np.float64)
     top_k = max(1, min(int(top_k), len(rows)))
-    order = np.argsort(-y_pred)
+    minimize = task_type != "classification" and str(objective_direction).lower() == "minimize"
+    order = np.argsort(y_pred if minimize else -y_pred)
     top_indices = order[:top_k]
-    best_true_index = int(np.argmax(y_true))
+    best_true_index = int(np.argmin(y_true) if minimize else np.argmax(y_true))
     true_best_prediction_rank = int(np.where(order == best_true_index)[0][0] + 1)
     overall_mean = float(np.mean(y_true))
     top_mean = float(np.mean(y_true[top_indices]))
@@ -1249,6 +2290,7 @@ def _ranking_audit(
         "top_k_enrichment": None if abs(overall_mean) < 1e-12 else float(top_mean / overall_mean),
         "best_true_item_rank_by_prediction": true_best_prediction_rank,
         "spearman": _spearman(y_true, y_pred),
+        "objective_direction": "minimize" if minimize else "maximize",
     }
 
 
@@ -1260,14 +2302,22 @@ def _prediction_audit_markdown(summary: dict[str, Any]) -> str:
     leakage_ok = (claim_gate.get("leakage_controlled") or {}).get("ok")
     lift_ok = (claim_gate.get("lift_claim") or {}).get("ok")
     calibration_ok = (claim_gate.get("uncertainty_usable") or {}).get("ok")
-    recommended_ok = (claim_gate.get("recommended") or {}).get("ok")
+    prioritization = claim_gate.get("candidate_prioritization") or {}
     manifest = report.get("evaluation_manifest") or {}
+    assurance = report.get("assurance_level") or {}
+    evidence = report.get("evidence_level") or {}
+    sensitivity = report.get("threshold_sensitivity") or {}
     lines = [
         f"# Model Prediction Audit: {summary['project']}",
         "",
         "## Verdict",
         "",
         report["verdict"],
+        "",
+        f"- Assurance source: {assurance.get('label')}",
+        f"- Evidence level: {evidence.get('label')}",
+        *[f"- Supporting evidence: {item}" for item in evidence.get("support") or []],
+        *[f"- Limitation: {item}" for item in evidence.get("limitations") or []],
         "",
         "## Data Readiness",
         "",
@@ -1283,6 +2333,7 @@ def _prediction_audit_markdown(summary: dict[str, Any]) -> str:
         f"- All rows metric: {report.get('all_rows_metrics', {}).get('primary_metric')}",
         f"- Retrospective clustered-split metric: {report.get('test_metrics', {}).get('primary_metric')}",
         f"- Best simple baseline: {report.get('best_simple_baseline')}",
+        f"- Paired lift interval: {report.get('lift_interval')}",
         "",
         "## Evaluation Manifest",
         "",
@@ -1293,17 +2344,35 @@ def _prediction_audit_markdown(summary: dict[str, Any]) -> str:
         f"- Training independence: {manifest.get('training_independence')}",
         f"- Candidate constraints verified: {manifest.get('constraints_verified')}",
         f"- Biological constraints: {manifest.get('biological_constraints')}",
+        f"- Threshold policy: {(manifest.get('threshold_policy') or {}).get('policy_name')}",
+        f"- Threshold source: {(manifest.get('threshold_policy') or {}).get('source')}",
         "",
-        "## Claim Gate",
+        "## Policy Checks",
         "",
-        f"- leakage_controlled: {leakage_ok}",
-        f"- lift_claim: {lift_ok}",
-        f"- uncertainty_usable: {calibration_ok}",
-        f"- recommended: {recommended_ok}",
+        f"- Leakage policy supported: {leakage_ok}",
+        f"- Lift policy supported: {lift_ok}",
+        f"- Uncertainty policy supported: {calibration_ok}",
+        f"- Candidate-prioritization status: {prioritization.get('status')}",
         "",
-        "## Uncertainty",
+        "## Threshold Sensitivity",
+        "",
+        str(sensitivity.get("interpretation") or "No threshold sensitivity analysis was available."),
         "",
     ]
+    for profile in sensitivity.get("profiles") or []:
+        lines.append(
+            f"- {profile.get('name')}: retrospective_criteria_met="
+            f"{profile.get('retrospective_criteria_met')}; thresholds={profile.get('thresholds')}"
+        )
+    lines.extend(
+        [
+            f"- Conclusion changes under stricter thresholds: "
+            f"{sensitivity.get('conclusion_changes_under_stricter_thresholds')}",
+            "",
+        ]
+    )
+    lines.extend(_similarity_sensitivity_markdown_lines(report))
+    lines.extend(["## Uncertainty", ""])
     for key, value in report.get("uncertainty_audit", {}).items():
         if key == "bins":
             continue
@@ -1331,37 +2400,27 @@ def _prediction_audit_markdown(summary: dict[str, Any]) -> str:
 
 def _prediction_verdict(
     *,
-    claim_gate: dict[str, Any],
-    test_metric: float | None,
+    evidence_level: dict[str, Any],
+    assurance_level: dict[str, Any],
 ) -> str:
-    if test_metric is None:
-        return "Audit-only: external predictions did not produce a trusted retrospective evaluation metric."
-    if not bool((claim_gate.get("leakage_controlled") or {}).get("ok")):
-        return "Audit-only: leakage-control criteria did not pass for claim-grade conclusions."
-    if not bool((claim_gate.get("lift_claim") or {}).get("ok")):
-        return "Audit-only: model-vs-baseline lift criteria did not pass documented thresholds."
-    if not bool((claim_gate.get("recommended") or {}).get("ok")):
-        return "Promising only as a pilot: supplied predictions beat baselines, but data volume or split quality is weak."
-    return "Recommended for next-round prioritization: claim gates passed for leakage control, lift, and recommendation readiness."
+    return _evidence_verdict(evidence_level, assurance_level)
 
 
 def _verdict(
     *,
-    claim_gate: dict[str, Any],
-    task_head_metric: float | None,
+    evidence_level: dict[str, Any],
+    assurance_level: dict[str, Any],
 ) -> str:
-    if task_head_metric is None:
-        return "Audit-only: task-head training or evaluation did not produce a trusted primary metric."
-    if not bool((claim_gate.get("leakage_controlled") or {}).get("ok")):
-        return "Audit-only: leakage-control criteria did not pass for claim-grade conclusions."
-    if not bool((claim_gate.get("lift_claim") or {}).get("ok")):
-        return "Audit-only: model-vs-baseline lift criteria did not pass documented thresholds."
-    if not bool((claim_gate.get("recommended") or {}).get("ok")):
-        return "Promising only as a pilot: model lift may exist, but data volume or split quality is not yet strong."
-    return "Recommended for next-round prioritization: claim gates passed for leakage control, lift, and recommendation readiness."
+    return _evidence_verdict(evidence_level, assurance_level)
 
 
-def _observed_incumbent(train_rows: list[dict[str, Any]], *, target_col: str, task_type: str) -> float | None:
+def _observed_incumbent(
+    train_rows: list[dict[str, Any]],
+    *,
+    target_col: str,
+    task_type: str,
+    objective_direction: str = "maximize",
+) -> float | None:
     if task_type == "classification":
         return None
     values: list[float] = []
@@ -1370,7 +2429,9 @@ def _observed_incumbent(train_rows: list[dict[str, Any]], *, target_col: str, ta
             values.append(float(row[target_col]))
         except (TypeError, ValueError):
             continue
-    return max(values) if values else None
+    if not values:
+        return None
+    return min(values) if str(objective_direction).lower() == "minimize" else max(values)
 
 
 def _row_identifier(row: dict[str, Any], *, id_col: str | None, fallback_prefix: str, fallback_index: int) -> str:
@@ -1451,15 +2512,10 @@ def _model_warning_tags(report: dict[str, Any], warnings: list[str]) -> list[str
         tags.append("weak_data_readiness")
     if "baseline" in joined and ("beat" in joined or "matched" in joined):
         tags.append("model_lift_not_proven")
-    uncertainty = report.get("uncertainty_audit") or {}
-    if uncertainty.get("status") == "ok":
-        spearman = uncertainty.get("uncertainty_abs_error_spearman")
-        gap = uncertainty.get("mean_absolute_calibration_gap")
-        mean_error = uncertainty.get("mean_abs_error")
-        if spearman is None or float(spearman) < 0.20:
-            tags.append("uncertainty_not_reliable")
-        if gap is not None and mean_error is not None and float(gap) > float(mean_error):
-            tags.append("uncertainty_calibration_warning")
+    uncertainty_check = ((report.get("claim_gate") or {}).get("uncertainty_usable") or {})
+    uncertainty_type = str((report.get("evaluation_manifest") or {}).get("uncertainty_type") or "none")
+    if uncertainty_type != "none" and not bool(uncertainty_check.get("ok")):
+        tags.append("uncertainty_not_reliable")
     return tags
 
 
@@ -1473,6 +2529,8 @@ def _candidate_ranking_reason(row: dict[str, Any], status: str, flags: list[str]
         f"uncertainty={uncertainty:.4f}" if uncertainty is not None else "uncertainty=n/a",
         f"acquisition={acquisition:.4f}" if acquisition is not None else "acquisition=n/a",
         f"cluster={cluster}",
+        f"acquisition_policy={row.get('acquisition_policy', 'unspecified')}",
+        f"diversity_policy={row.get('diversity_policy', 'unspecified')}",
         f"training_status={status}",
     ]
     if flags:
@@ -1493,7 +2551,14 @@ def _candidate_explanations(
 ) -> list[dict[str, Any]]:
     if not ranked:
         return []
-    uncertainties = np.asarray([float(_safe_float(row.get("uncertainty")) or 0.0) for row in ranked], dtype=np.float64)
+    uncertainties = np.asarray(
+        [
+            float(value)
+            for row in ranked
+            if (value := _safe_float(row.get("uncertainty"))) is not None
+        ],
+        dtype=np.float64,
+    )
     high_uncertainty_cutoff = float(np.quantile(uncertainties, 0.75)) if uncertainties.size else 0.0
     global_tags = _model_warning_tags(report, warnings)
 
@@ -1510,9 +2575,11 @@ def _candidate_explanations(
         sequence = str(row.get(sequence_col, "") or "")
         status = _training_distribution_status(sequence, nearest)
         flags = list(global_tags)
-        uncertainty = float(_safe_float(row.get("uncertainty")) or 0.0)
-        if uncertainty > 0 and uncertainty >= high_uncertainty_cutoff:
+        uncertainty = _safe_float(row.get("uncertainty"))
+        if uncertainty is not None and uncertainty >= high_uncertainty_cutoff:
             flags.append("high_uncertainty")
+        if "prediction_only" in str(row.get("uncertainty_status") or ""):
+            flags.append("uncertainty_not_used")
         if status in {"outside_training_distribution", "sparse_training_neighborhood"}:
             flags.append(status)
 
@@ -1524,9 +2591,16 @@ def _candidate_explanations(
             "sequence": sequence,
             "prediction": row.get("prediction"),
             "uncertainty": row.get("uncertainty"),
+            "uncertainty_status": row.get("uncertainty_status"),
+            "acquisition_policy": row.get("acquisition_policy"),
             "acquisition_score": row.get("acquisition_score"),
             "diversified_acquisition_score": row.get("diversified_acquisition_score"),
             "diversity_cluster": row.get("diversity_cluster", ""),
+            "diversity_policy": row.get("diversity_policy", ""),
+            "max_similarity_to_previous_selection": row.get("max_similarity_to_previous_selection"),
+            "diversity_penalty_applied": row.get("diversity_penalty_applied"),
+            "prioritization_status": row.get("prioritization_status", ""),
+            "evidence_level": row.get("evidence_level", ""),
             "training_distribution_status": status,
             "nearest_training_examples": nearest,
             "nearest_train_id": top_neighbor.get("id", ""),
@@ -1580,9 +2654,16 @@ def _write_candidate_explanations(
             "sequence",
             "prediction",
             "uncertainty",
+            "uncertainty_status",
+            "acquisition_policy",
             "acquisition_score",
             "diversified_acquisition_score",
             "diversity_cluster",
+            "diversity_policy",
+            "max_similarity_to_previous_selection",
+            "diversity_penalty_applied",
+            "prioritization_status",
+            "evidence_level",
             "training_distribution_status",
             "nearest_train_id",
             "nearest_train_similarity",
@@ -1614,15 +2695,12 @@ def _rank_candidates(
         return []
     pred = predict_with_task_head_ensemble(ensemble, candidate_rows)
     
-    # We pass standard maximizing acquisition first
-    acquisition = acquisition_scores(
-        pred["mean"],
-        pred["std"],
-        method=acquisition_method,
-        beta=beta,
-        incumbent=_observed_incumbent(train_rows, target_col=target_col, task_type=task_type),
+    incumbent = _observed_incumbent(
+        train_rows,
+        target_col=target_col,
+        task_type=task_type,
+        objective_direction=objective_direction,
     )
-    
     if objective_direction.lower() == "minimize":
         mean_arr = np.asarray(pred["mean"], dtype=np.float64)
         std_arr = np.asarray(pred["std"], dtype=np.float64)
@@ -1630,7 +2708,7 @@ def _rank_candidates(
             acquisition_display = mean_arr - beta * std_arr
             acquisition_ranking = -acquisition_display
         elif acquisition_method.lower() in {"expected_improvement", "ei"}:
-            best = float(np.min(mean_arr) if _observed_incumbent(train_rows, target_col=target_col, task_type=task_type) is None else _observed_incumbent(train_rows, target_col=target_col, task_type=task_type))
+            best = float(np.min(mean_arr) if incumbent is None else incumbent)
             improvement = best - mean_arr
             std_clipped = np.maximum(std_arr, 1e-9)
             z = improvement / std_clipped
@@ -1640,6 +2718,13 @@ def _rank_candidates(
             acquisition_display = mean_arr
             acquisition_ranking = -mean_arr
     else:
+        acquisition = acquisition_scores(
+            pred["mean"],
+            pred["std"],
+            method=acquisition_method,
+            beta=beta,
+            incumbent=incumbent,
+        )
         acquisition_display = acquisition
         acquisition_ranking = acquisition
 
@@ -1648,6 +2733,8 @@ def _rank_candidates(
         out = dict(row)
         out["prediction"] = float(pred["mean"][idx])
         out["uncertainty"] = float(pred["std"][idx])
+        out["uncertainty_status"] = "used_model_ensemble_uncertainty"
+        out["acquisition_policy"] = str(acquisition_method)
         out["acquisition_score"] = float(acquisition_display[idx])
         enriched.append(out)
         
@@ -1680,6 +2767,10 @@ def run_assayready(**params: Any) -> dict[str, Any]:
     group_cols = list(params.get("group_cols") or [])
     evaluation_manifest = dict(params.get("evaluation_manifest") or inferred_manifest_for_args(task_type=task_type).to_dict())
     evaluation_manifest["training_independence"] = "internally_controlled"
+    prospective_verification_warnings = _verify_prospective_artifacts(
+        evaluation_manifest,
+        assay_files=[Path(path) for path in params["assay_files"]],
+    )
     manifest_source = str(params.get("manifest_source") or "inferred_from_args")
     positive_label = params.get("positive_label") or evaluation_manifest.get("positive_label")
     artifact_dir = _artifact_dir(project, params.get("output_dir"))
@@ -1709,6 +2800,7 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         group_cols=group_cols,
         homology_threshold=float(params["homology_threshold"]),
         homology_k=int(params["homology_k"]),
+        similarity_policy=str(params.get("similarity_policy") or "canonical_kmer_jaccard"),
         seed=int(params["seed"]),
     )
     processed_dir = artifact_dir / "processed"
@@ -1724,6 +2816,7 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         target_col=target_col,
         seed=int(params["seed"]),
         positive_label=positive_label,
+        include_predictions=True,
     )
     try:
         ensemble = fit_task_head_ensemble(
@@ -1752,6 +2845,7 @@ def run_assayready(**params: Any) -> dict[str, Any]:
                     "id": row.get(id_col) if id_col else idx,
                     "sequence_hash": row.get("sequence_hash"),
                     "split": "test",
+                    "leakage_cluster": row.get("leakage_cluster"),
                     "target": row.get(target_col),
                     "prediction": float(pred["mean"][idx]),
                     "uncertainty": float(pred["std"][idx]),
@@ -1765,9 +2859,14 @@ def run_assayready(**params: Any) -> dict[str, Any]:
     )
 
     best_name, best_value = best_simple_baseline(baselines, task_type)
+    best_baseline_predictions = _pop_baseline_predictions(baselines, best_name=best_name)
     task_head_metrics = ensemble.get("metrics") or {}
     task_head_metric = task_head_metrics.get("primary_metric")
-    warnings = list(audit.warnings) + list(split_diagnostics.get("warnings") or [])
+    warnings = (
+        list(audit.warnings)
+        + list(split_diagnostics.get("warnings") or [])
+        + prospective_verification_warnings
+    )
     if manifest_source not in {"config", "ui_declared"}:
         warnings.append("Evaluation manifest was inferred from CLI arguments; provide config.evaluation for auditable provenance.")
     if ensemble.get("status") != "ok":
@@ -1783,6 +2882,7 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         homology_threshold=float(params["homology_threshold"]),
         homology_k=int(params["homology_k"]),
         group_cols=group_cols,
+        similarity_policy=str(params.get("similarity_policy") or "canonical_kmer_jaccard"),
     )
     model_metric_ci = _bootstrap_metric_ci(
         prediction_rows,
@@ -1791,9 +2891,39 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         prediction_col="prediction",
         positive_label=positive_label,
     )
-    lift_delta_ci = _lift_ci_from_metric_ci(model_metric_ci, best_value)
+    paired_lift = _paired_lift_bootstrap(
+        prediction_rows,
+        baseline_predictions=best_baseline_predictions,
+        task_type=task_type,
+        target_col="target",
+        prediction_col="prediction",
+        positive_label=positive_label,
+        baseline_name=best_name,
+    )
+    _write_baseline_comparison(
+        artifact_dir / "baseline_predictions.csv",
+        prediction_rows,
+        baseline_predictions=best_baseline_predictions,
+        baseline_name=best_name,
+        target_col="target",
+        prediction_col="prediction",
+    )
+    similarity_sensitivity = {
+        "status": "not_evaluated",
+        "reference": {
+            "similarity_policy": str(params.get("similarity_policy") or "canonical_kmer_jaccard"),
+            "similarity_threshold": float(params["homology_threshold"]),
+        },
+        "conclusion_changes_across_similarity_settings": False,
+        "reason": (
+            "Internal-model conclusion sensitivity requires refitting the task head for every alternate split; "
+            "this run records the selected policy but does not pretend fixed predictions answer that question."
+        ),
+    }
+    _write_json(artifact_dir / "similarity_sensitivity.json", similarity_sensitivity)
+    lift_delta_ci = tuple(paired_lift["interval"]) if paired_lift.get("interval") else None
 
-    benchmark_claim_gate = _claim_gate(
+    benchmark_claim_gate, threshold_sensitivity, assurance_level, evidence_level = _evaluate_report_evidence(
         task_type=task_type,
         split_diagnostics=split_diagnostics,
         warnings=warnings,
@@ -1805,6 +2935,8 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         cross_split_violations=cross_split_violations,
         model_metric_ci=model_metric_ci,
         lift_delta_ci=lift_delta_ci,
+        external_predictions=False,
+        similarity_sensitivity=similarity_sensitivity,
     )
     benchmark_report = {
         "schema_version": 1,
@@ -1813,12 +2945,17 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         "primary_metric_name": task_head_metrics.get("primary_metric_name") or _primary_metric_name(task_type),
         "baselines": baselines,
         "best_simple_baseline": best_baseline,
+        "lift_interval": paired_lift,
         "task_head": task_head_metrics,
         "task_head_primary_metric": task_head_metric,
         "evaluation_manifest": evaluation_manifest,
         "claim_gate": benchmark_claim_gate,
+        "threshold_sensitivity": threshold_sensitivity,
+        "similarity_sensitivity": similarity_sensitivity,
+        "assurance_level": assurance_level,
+        "evidence_level": evidence_level,
         "warnings": warnings,
-        "verdict": _verdict(claim_gate=benchmark_claim_gate, task_head_metric=task_head_metric),
+        "verdict": _verdict(evidence_level=evidence_level, assurance_level=assurance_level),
     }
     _write_json(artifact_dir / "evaluation_manifest.json", evaluation_manifest)
 
@@ -1857,7 +2994,7 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         _write_json(artifact_dir / "generation_report.json", generation_report)
         write_table(artifact_dir / "generated_candidates.csv", generated)
     else:
-        warnings.append("No candidate file or generated candidate pool was provided; ranked_candidates.csv is empty.")
+        warnings.append("No candidate file or generated candidate pool was provided; candidate_prioritization.csv is empty.")
 
     for row in candidate_rows:
         row.setdefault("sequence_hash", stable_sequence_hash(row.get(sequence_col, "")))
@@ -1877,19 +3014,26 @@ def run_assayready(**params: Any) -> dict[str, Any]:
     )
     ranked_fields = [
         "rank",
-        "recommendation",
+        "prioritization_status",
+        "evidence_level",
         "diversity_cluster",
+        "diversity_policy",
+        "diversity_policy_requested",
+        "max_similarity_to_previous_selection",
+        "diversity_penalty_applied",
         "sequence_hash",
         sequence_col,
         "prediction",
         "uncertainty",
+        "uncertainty_status",
+        "acquisition_policy",
         "acquisition_score",
         "diversified_acquisition_score",
     ]
     if id_col:
         ranked_fields.insert(3, id_col)
 
-    benchmark_claim_gate = _claim_gate(
+    benchmark_claim_gate, threshold_sensitivity, assurance_level, evidence_level = _evaluate_report_evidence(
         task_type=task_type,
         split_diagnostics=split_diagnostics,
         warnings=warnings,
@@ -1901,14 +3045,23 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         cross_split_violations=cross_split_violations,
         model_metric_ci=model_metric_ci,
         lift_delta_ci=lift_delta_ci,
+        external_predictions=False,
+        similarity_sensitivity=similarity_sensitivity,
     )
-    recommendation_ok = benchmark_claim_gate["recommended"]["ok"]
+    prioritization_status = benchmark_claim_gate["candidate_prioritization"]["status"]
     for row in ranked:
-        row["recommendation"] = recommendation_ok
+        row.pop("recommendation", None)
+        row["prioritization_status"] = prioritization_status
+        row["evidence_level"] = evidence_level["key"]
 
+    write_table(artifact_dir / "candidate_prioritization.csv", ranked, fieldnames=ranked_fields)
     write_table(artifact_dir / "ranked_candidates.csv", ranked, fieldnames=ranked_fields)
     benchmark_report["claim_gate"] = benchmark_claim_gate
-    benchmark_report["verdict"] = _verdict(claim_gate=benchmark_claim_gate, task_head_metric=task_head_metric)
+    benchmark_report["threshold_sensitivity"] = threshold_sensitivity
+    benchmark_report["similarity_sensitivity"] = similarity_sensitivity
+    benchmark_report["assurance_level"] = assurance_level
+    benchmark_report["evidence_level"] = evidence_level
+    benchmark_report["verdict"] = _verdict(evidence_level=evidence_level, assurance_level=assurance_level)
     _write_json(artifact_dir / "benchmark_report.json", benchmark_report)
     _write_text(artifact_dir / "benchmark_report.md", _benchmark_markdown(benchmark_report))
 
@@ -1931,16 +3084,19 @@ def run_assayready(**params: Any) -> dict[str, Any]:
         "benchmark_report.md",
         "benchmark_report.json",
         "evaluation_manifest.json",
+        "candidate_prioritization.csv",
         "ranked_candidates.csv",
         "candidate_explanations.csv",
         "candidate_explanations.json",
         "predictions.csv",
+        "baseline_predictions.csv",
         "failure_cases.csv",
         "model_card.md",
         "processed/train.csv",
         "processed/val.csv",
         "processed/test.csv",
         "split_diagnostics.json",
+        "similarity_sensitivity.json",
     ]
     if generated_count:
         artifacts.extend(["generated_candidates.csv", "generation_report.json"])
@@ -2003,8 +3159,14 @@ def _filter_prediction_rows(
         clean[prediction_col] = prediction
         if uncertainty_col:
             uncertainty = _safe_float(clean.get(uncertainty_col))
-            if uncertainty is not None:
-                clean[uncertainty_col] = max(0.0, uncertainty)
+            if uncertainty is not None and uncertainty >= 0:
+                clean[uncertainty_col] = uncertainty
+                clean["uncertainty_input_status"] = "provided_valid"
+            else:
+                clean[uncertainty_col] = None
+                clean["uncertainty_input_status"] = "missing_or_invalid"
+        else:
+            clean["uncertainty_input_status"] = "not_provided"
         valid.append(clean)
     return valid, failures
 
@@ -2015,6 +3177,7 @@ def _rank_external_predictions(
     sequence_col: str,
     prediction_col: str,
     uncertainty_col: str | None,
+    uncertainty_type: str = "none",
     beta: float,
     diversity_method: str,
     diversity_penalty: float,
@@ -2024,23 +3187,47 @@ def _rank_external_predictions(
     if not rows:
         return []
     prediction = np.asarray([float(row[prediction_col]) for row in rows], dtype=np.float64)
-    if uncertainty_col:
-        uncertainty = np.asarray([float(_safe_float(row.get(uncertainty_col)) or 0.0) for row in rows], dtype=np.float64)
-    else:
-        uncertainty = np.zeros(len(rows), dtype=np.float64)
+    uncertainty_values = [
+        _safe_float(row.get(uncertainty_col)) if uncertainty_col else None for row in rows
+    ]
+    declared_usable = str(uncertainty_type or "none").lower() in {
+        "predicted_absolute_error",
+        "predictive_standard_deviation",
+    }
+    uncertainty_enabled = bool(
+        uncertainty_col
+        and declared_usable
+        and all(value is not None and value >= 0 for value in uncertainty_values)
+    )
+    uncertainty_for_score = np.asarray(
+        [float(value) for value in uncertainty_values] if uncertainty_enabled else np.zeros(len(rows)),
+        dtype=np.float64,
+    )
         
     if objective_direction.lower() == "minimize":
-        acquisition_display = prediction - float(beta) * uncertainty
+        acquisition_display = prediction - float(beta) * uncertainty_for_score
         acquisition_ranking = -acquisition_display
     else:
-        acquisition_display = prediction + float(beta) * uncertainty
+        acquisition_display = prediction + float(beta) * uncertainty_for_score
         acquisition_ranking = acquisition_display
 
     enriched: list[dict[str, Any]] = []
     for idx, row in enumerate(rows):
         out = dict(row)
         out["prediction"] = float(prediction[idx])
-        out["uncertainty"] = float(uncertainty[idx])
+        raw_uncertainty = uncertainty_values[idx]
+        out["uncertainty"] = float(raw_uncertainty) if raw_uncertainty is not None else None
+        if uncertainty_enabled:
+            out["uncertainty_status"] = "used_declared_uncertainty"
+        elif raw_uncertainty is None:
+            out["uncertainty_status"] = "missing_or_invalid_prediction_only"
+        elif not declared_usable:
+            out["uncertainty_status"] = "semantics_not_declared_prediction_only"
+        else:
+            out["uncertainty_status"] = "pool_incomplete_prediction_only"
+        out["acquisition_policy"] = (
+            "prediction_plus_declared_uncertainty" if uncertainty_enabled else "prediction_only"
+        )
         out["acquisition_score"] = float(acquisition_display[idx])
         enriched.append(out)
         
@@ -2077,6 +3264,11 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
     evaluation_manifest = dict(
         params.get("evaluation_manifest")
         or inferred_manifest_for_args(task_type=task_type, positive_label=positive_label).to_dict()
+    )
+    positive_label = positive_label or evaluation_manifest.get("positive_label")
+    prospective_verification_warnings = _verify_prospective_artifacts(
+        evaluation_manifest,
+        assay_files=[Path(path) for path in params["assay_files"]],
     )
     manifest_source = str(params.get("manifest_source") or "inferred_from_args")
     artifact_dir = _artifact_dir(project, params.get("output_dir"))
@@ -2124,6 +3316,7 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         group_cols=group_cols,
         homology_threshold=float(params["homology_threshold"]),
         homology_k=int(params["homology_k"]),
+        similarity_policy=str(params.get("similarity_policy") or "canonical_kmer_jaccard"),
         seed=int(params["seed"]),
     )
     processed_dir = artifact_dir / "processed"
@@ -2139,6 +3332,7 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         target_col=target_col,
         seed=int(params["seed"]),
         positive_label=positive_label,
+        include_predictions=True,
     )
     all_rows_metrics = _prediction_metrics(
         prediction_rows,
@@ -2174,11 +3368,18 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         prediction_col=prediction_col,
         top_k=int(params["top_k"]),
         positive_label=positive_label,
+        objective_direction=str(evaluation_manifest.get("objective_direction") or "maximize"),
     )
     best_name, best_value = best_simple_baseline(baselines, task_type)
+    best_baseline_predictions = _pop_baseline_predictions(baselines, best_name=best_name)
     best_baseline = {"name": best_name, "primary_metric": best_value}
-    warnings = list(audit.warnings) + list(split_diagnostics.get("warnings") or [])
-    warnings.append("Warning: Splitting already-generated external predictions does not guarantee leakage-safety because model-training provenance is unknown. Retrospective split is for baseline comparison only.")
+    warnings = (
+        list(audit.warnings)
+        + list(split_diagnostics.get("warnings") or [])
+        + prospective_verification_warnings
+    )
+    if str(evaluation_manifest.get("training_independence") or "unverified").lower() == "unverified":
+        warnings.append("Warning: Splitting already-generated external predictions does not guarantee leakage-safety because model-training provenance is unknown. Retrospective split is for baseline comparison only.")
     if manifest_source not in {"config", "ui_declared"}:
         warnings.append("Evaluation manifest was inferred from CLI arguments; provide config.evaluation for auditable provenance.")
     if uncertainty_col and str(evaluation_manifest.get("uncertainty_type") or "none") == "none":
@@ -2196,6 +3397,7 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         homology_threshold=float(params["homology_threshold"]),
         homology_k=int(params["homology_k"]),
         group_cols=group_cols,
+        similarity_policy=str(params.get("similarity_policy") or "canonical_kmer_jaccard"),
     )
     model_metric_ci = _bootstrap_metric_ci(
         splits["test"],
@@ -2204,9 +3406,48 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         prediction_col=prediction_col,
         positive_label=positive_label,
     )
-    lift_delta_ci = _lift_ci_from_metric_ci(model_metric_ci, best_value)
+    paired_lift = _paired_lift_bootstrap(
+        splits["test"],
+        baseline_predictions=best_baseline_predictions,
+        task_type=task_type,
+        target_col=target_col,
+        prediction_col=prediction_col,
+        positive_label=positive_label,
+        baseline_name=best_name,
+    )
+    _write_baseline_comparison(
+        artifact_dir / "baseline_predictions.csv",
+        splits["test"],
+        baseline_predictions=best_baseline_predictions,
+        baseline_name=best_name,
+        target_col=target_col,
+        prediction_col=prediction_col,
+    )
+    similarity_sensitivity = _similarity_sensitivity_analysis(
+        prediction_rows,
+        task_type=task_type,
+        sequence_col=sequence_col,
+        target_col=target_col,
+        prediction_col=prediction_col,
+        positive_label=positive_label,
+        group_cols=group_cols,
+        val_fraction=float(params["val_fraction"]),
+        test_fraction=float(params["test_fraction"]),
+        selected_policy=str(params.get("similarity_policy") or "canonical_kmer_jaccard"),
+        selected_threshold=float(params["homology_threshold"]),
+        homology_k=int(params["homology_k"]),
+        seed=int(params["seed"]),
+        evaluation_manifest=evaluation_manifest,
+        warnings=warnings,
+        configured_policies=list(params.get("similarity_sensitivity_policies") or []),
+        configured_thresholds=[
+            float(item) for item in params.get("similarity_sensitivity_thresholds") or []
+        ],
+    )
+    _write_json(artifact_dir / "similarity_sensitivity.json", similarity_sensitivity)
+    lift_delta_ci = tuple(paired_lift["interval"]) if paired_lift.get("interval") else None
 
-    prediction_claim_gate = _claim_gate(
+    prediction_claim_gate, threshold_sensitivity, assurance_level, evidence_level = _evaluate_report_evidence(
         task_type=task_type,
         split_diagnostics=split_diagnostics,
         warnings=warnings,
@@ -2219,6 +3460,7 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         model_metric_ci=model_metric_ci,
         lift_delta_ci=lift_delta_ci,
         external_predictions=True,
+        similarity_sensitivity=similarity_sensitivity,
     )
 
     report = {
@@ -2234,11 +3476,16 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         "test_metrics": test_metrics,
         "baselines": baselines,
         "best_simple_baseline": best_baseline,
+        "lift_interval": paired_lift,
         "uncertainty_audit": uncertainty,
         "ranking_audit": ranking,
         "claim_gate": prediction_claim_gate,
+        "threshold_sensitivity": threshold_sensitivity,
+        "similarity_sensitivity": similarity_sensitivity,
+        "assurance_level": assurance_level,
+        "evidence_level": evidence_level,
         "warnings": warnings,
-        "verdict": _prediction_verdict(claim_gate=prediction_claim_gate, test_metric=test_primary),
+        "verdict": _prediction_verdict(evidence_level=evidence_level, assurance_level=assurance_level),
     }
     _write_json(artifact_dir / "evaluation_manifest.json", evaluation_manifest)
 
@@ -2275,21 +3522,34 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         sequence_col=sequence_col,
         prediction_col=prediction_col,
         uncertainty_col=uncertainty_col,
+        uncertainty_type=str(evaluation_manifest.get("uncertainty_type") or "none"),
         beta=float(params["beta"]),
         diversity_method=params["diversity_method"],
         diversity_penalty=float(params["diversity_penalty"]),
         top_k=int(params["top_k"]),
         objective_direction=evaluation_manifest.get("objective_direction", "maximize"),
     )
+    if ranked and any(row.get("acquisition_policy") == "prediction_only" for row in ranked):
+        warnings.append(
+            "Candidate prioritization used prediction_only scoring because uncertainty was absent, invalid, "
+            "incomplete, or not declared with supported semantics; no zero-uncertainty claim was imputed."
+        )
     ranked_fields = [
         "rank",
-        "recommendation",
+        "prioritization_status",
+        "evidence_level",
         "diversity_cluster",
+        "diversity_policy",
+        "diversity_policy_requested",
+        "max_similarity_to_previous_selection",
+        "diversity_penalty_applied",
         "sequence_hash",
         sequence_col,
         prediction_col,
         "prediction",
         "uncertainty",
+        "uncertainty_status",
+        "acquisition_policy",
         "acquisition_score",
         "diversified_acquisition_score",
     ]
@@ -2298,7 +3558,7 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
     if id_col:
         ranked_fields.insert(3, id_col)
 
-    prediction_claim_gate = _claim_gate(
+    prediction_claim_gate, threshold_sensitivity, assurance_level, evidence_level = _evaluate_report_evidence(
         task_type=task_type,
         split_diagnostics=split_diagnostics,
         warnings=warnings,
@@ -2311,14 +3571,22 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         model_metric_ci=model_metric_ci,
         lift_delta_ci=lift_delta_ci,
         external_predictions=True,
+        similarity_sensitivity=similarity_sensitivity,
     )
-    recommendation_ok = prediction_claim_gate["recommended"]["ok"]
+    prioritization_status = prediction_claim_gate["candidate_prioritization"]["status"]
     for row in ranked:
-        row["recommendation"] = recommendation_ok
+        row.pop("recommendation", None)
+        row["prioritization_status"] = prioritization_status
+        row["evidence_level"] = evidence_level["key"]
 
+    write_table(artifact_dir / "candidate_prioritization.csv", ranked, fieldnames=ranked_fields)
     write_table(artifact_dir / "ranked_candidates.csv", ranked, fieldnames=ranked_fields)
     report["claim_gate"] = prediction_claim_gate
-    report["verdict"] = _prediction_verdict(claim_gate=prediction_claim_gate, test_metric=test_primary)
+    report["threshold_sensitivity"] = threshold_sensitivity
+    report["similarity_sensitivity"] = similarity_sensitivity
+    report["assurance_level"] = assurance_level
+    report["evidence_level"] = evidence_level
+    report["verdict"] = _prediction_verdict(evidence_level=evidence_level, assurance_level=assurance_level)
     _write_json(artifact_dir / "prediction_audit_report.json", report)
     _write_text(
         artifact_dir / "prediction_audit_report.md",
@@ -2355,6 +3623,8 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         "prediction_audit_report.md",
         "prediction_audit_report.json",
         "evaluation_manifest.json",
+        "baseline_predictions.csv",
+        "candidate_prioritization.csv",
         "ranked_candidates.csv",
         "candidate_explanations.csv",
         "candidate_explanations.json",
@@ -2366,6 +3636,7 @@ def run_prediction_audit(**params: Any) -> dict[str, Any]:
         "processed/val.csv",
         "processed/test.csv",
         "split_diagnostics.json",
+        "similarity_sensitivity.json",
         "execution_manifest.json",
     ]
     execution = _execution_manifest(
@@ -2426,13 +3697,14 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--test-fraction", type=float, default=0.15)
     run.add_argument("--homology-threshold", type=float, default=0.90)
     run.add_argument("--homology-k", type=int, default=8)
+    run.add_argument("--similarity-policy", default="canonical_kmer_jaccard")
     run.add_argument("--epochs", type=int, default=80)
     run.add_argument("--learning-rate", type=float, default=1e-3)
     run.add_argument("--ensemble-size", type=int, default=5)
     run.add_argument("--seed", type=int, default=13)
     run.add_argument("--acquisition-method", default="upper_confidence_bound")
     run.add_argument("--beta", type=float, default=1.0)
-    run.add_argument("--diversity-method", default="greedy_embedding_cosine")
+    run.add_argument("--diversity-method", default="kmer_cosine")
     run.add_argument("--diversity-penalty", type=float, default=0.2)
     run.add_argument("--top-k", type=int, default=96)
     run.add_argument("--generate-candidates", action="store_true")
@@ -2462,9 +3734,12 @@ def _build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--test-fraction", type=float, default=0.15)
     audit.add_argument("--homology-threshold", type=float, default=0.90)
     audit.add_argument("--homology-k", type=int, default=8)
+    audit.add_argument("--similarity-policy", default="canonical_kmer_jaccard")
+    audit.add_argument("--similarity-sensitivity-policies", nargs="*", default=[])
+    audit.add_argument("--similarity-sensitivity-thresholds", nargs="*", type=float, default=[])
     audit.add_argument("--seed", type=int, default=13)
     audit.add_argument("--beta", type=float, default=1.0)
-    audit.add_argument("--diversity-method", default="greedy_embedding_cosine")
+    audit.add_argument("--diversity-method", default="kmer_cosine")
     audit.add_argument("--diversity-penalty", type=float, default=0.2)
     audit.add_argument("--top-k", type=int, default=96)
     audit.add_argument("--print-json", action="store_true")
@@ -2480,12 +3755,103 @@ def _build_parser() -> argparse.ArgumentParser:
     runs_show.add_argument("run_id")
     runs_verify = runs_subparsers.add_parser("verify", help="Verify stored artifact sizes and checksums.")
     runs_verify.add_argument("run_id")
+
+    model = subparsers.add_parser("model", help="Run a model in a locked, network-disabled container.")
+    model_subparsers = model.add_subparsers(dest="model_command", required=True)
+    model_execute = model_subparsers.add_parser("execute", help="Execute an immutable container specification.")
+    model_execute.add_argument("--spec", required=True, help="Controlled-execution JSON specification.")
+    model_scaffold = model_subparsers.add_parser(
+        "scaffold-dnabert2", help="Create the pinned DNABERT-2 training and container bundle."
+    )
+    model_scaffold.add_argument("--output-dir", required=True)
+    model_download = model_subparsers.add_parser(
+        "download-dnabert2", help="Download and verify the pinned DNABERT-2 Safetensors snapshot."
+    )
+    model_download.add_argument("--output-dir", required=True)
+    model_prepare = model_subparsers.add_parser(
+        "prepare-dnabert2", help="Scaffold the bundle and download its pinned model weights."
+    )
+    model_prepare.add_argument("--output-dir", required=True)
+
+    policies = subparsers.add_parser("policy", help="Inspect versioned assay policy packs.")
+    policy_subparsers = policies.add_subparsers(dest="policy_command", required=True)
+    policy_subparsers.add_parser("list", help="List bundled policy packs.")
+    policy_show = policy_subparsers.add_parser("show", help="Show and hash a policy pack.")
+    policy_show.add_argument("name")
+
+    campaigns = subparsers.add_parser("campaign", help="Track experimental campaigns, rounds, and outcomes.")
+    campaigns.add_argument("--db", help="Optional campaign SQLite database path.")
+    campaigns.add_argument("--actor", default="local-cli", help="Identity recorded in the audit trail.")
+    campaign_subparsers = campaigns.add_subparsers(dest="campaign_command", required=True)
+    campaign_create = campaign_subparsers.add_parser("create", help="Create a campaign.")
+    campaign_create.add_argument("--campaign-id", required=True)
+    campaign_create.add_argument("--name", required=True)
+    campaign_create.add_argument("--assay-type", required=True)
+    campaign_create.add_argument("--objective-direction", choices=["maximize", "minimize"], default="maximize")
+    campaign_create.add_argument("--owner", required=True)
+    campaign_subparsers.add_parser("list", help="List campaigns.")
+    campaign_round = campaign_subparsers.add_parser("add-round", help="Lock a candidate selection as a campaign round.")
+    campaign_round.add_argument("--campaign-id", required=True)
+    campaign_round.add_argument("--round-number", type=int, required=True)
+    campaign_round.add_argument("--model-version", required=True)
+    campaign_round.add_argument("--dataset-version", required=True)
+    campaign_round.add_argument("--selection", required=True)
+    campaign_round.add_argument("--id-column", default="candidate_id")
+    campaign_round.add_argument("--prediction-column", default="prediction")
+    campaign_round.add_argument("--uncertainty-column", default="uncertainty")
+    campaign_round.add_argument("--family-column")
+    campaign_round.add_argument("--run-id")
+    campaign_round.add_argument("--policy-pack")
+    campaign_round.add_argument("--selected-at", help="ISO-8601 selection timestamp; defaults to now.")
+    campaign_outcomes = campaign_subparsers.add_parser("import-outcomes", help="Import measured outcomes for a locked round.")
+    campaign_outcomes.add_argument("--round-id", required=True)
+    campaign_outcomes.add_argument("--outcomes", required=True)
+    campaign_outcomes.add_argument("--id-column", default="candidate_id")
+    campaign_outcomes.add_argument("--value-column", default="measured_value")
+    campaign_outcomes.add_argument("--replicate-column", default="replicate")
+    campaign_outcomes.add_argument("--batch-column", default="batch")
+    campaign_outcomes.add_argument("--cost-column", default="cost")
+    campaign_outcomes.add_argument("--measured-at", help="ISO-8601 measurement timestamp; defaults to now.")
+    campaign_compare = campaign_subparsers.add_parser("compare", help="Compare all measured rounds in a campaign.")
+    campaign_compare.add_argument("--campaign-id", required=True)
+    campaign_export = campaign_subparsers.add_parser("export", help="Export a vendor-neutral campaign package.")
+    campaign_export.add_argument("--campaign-id", required=True)
+    campaign_export.add_argument("--output")
+    campaign_protocol = campaign_subparsers.add_parser(
+        "protocol", help="Export a validated prospective-protocol block for an evaluation manifest."
+    )
+    campaign_protocol.add_argument("--round-id", required=True)
+    campaign_protocol.add_argument("--output")
+    campaign_archive = campaign_subparsers.add_parser("archive", help="Archive a campaign without deleting data.")
+    campaign_archive.add_argument("--campaign-id", required=True)
+    campaign_purge = campaign_subparsers.add_parser(
+        "purge", help="Permanently delete campaign rounds and outcomes; the audit event remains."
+    )
+    campaign_purge.add_argument("--campaign-id", required=True)
+    campaign_purge.add_argument("--confirm", required=True, help="Must exactly equal the campaign ID.")
+    campaign_subparsers.add_parser("verify-audit", help="Verify the tamper-evident campaign audit chain.")
+
+    batch = subparsers.add_parser("batch-design", help="Create a constrained, reviewable plate layout.")
+    batch.add_argument("--candidates", required=True)
+    batch.add_argument("--output", required=True)
+    batch.add_argument("--policy-pack", required=True)
+    batch.add_argument("--family-column")
+    batch.add_argument("--max-per-family", type=int)
+    batch.add_argument("--cost-column")
+    batch.add_argument("--max-total-cost", type=float)
+    batch.add_argument("--objective-weight", action="append", default=[], help="column=weight; may be repeated.")
+    batch.add_argument("--seed", type=int, default=13)
+    batch.add_argument("--scientist-approval", help="Approver identifier; absent plans remain drafts.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in {"run", "audit-predictions", "doctor", "runs", "--version"}:
+    commands = {
+        "run", "audit-predictions", "doctor", "runs", "model", "policy", "campaign", "batch-design",
+        "--version", "--help", "-h"
+    }
+    if not argv or argv[0] not in commands:
         argv = ["run", *argv]
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -2494,6 +3860,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "runs":
         return run_registry_command(args)
     try:
+        if args.command == "campaign":
+            return run_campaign_command(args)
+        if args.command == "policy":
+            return run_policy_command(args)
+        if args.command == "model":
+            return run_model_command(args)
+        if args.command == "batch-design":
+            return run_batch_design_command(args)
         if args.command == "audit-predictions":
             if args.config:
                 config_path = Path(args.config).resolve()

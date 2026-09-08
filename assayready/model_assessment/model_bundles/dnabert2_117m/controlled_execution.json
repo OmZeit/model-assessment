@@ -1,0 +1,15 @@
+{
+  "image": "registry.example.org/team/assayready-dnabert2@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "input_file": "locked_sequences.csv",
+  "output_dir": "outputs/controlled_output",
+  "output_filename": "predictions.csv",
+  "id_column": "sequence_id",
+  "prediction_column": "model_prediction",
+  "uncertainty_column": "model_uncertainty",
+  "runtime": "docker",
+  "timeout_seconds": 1800,
+  "memory": "12g",
+  "cpus": 4,
+  "gpu_device": "0",
+  "command": []
+}

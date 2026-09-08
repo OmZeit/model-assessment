@@ -1,0 +1,30 @@
+schema_version: 1
+name: protein_activity
+version: "1.0"
+status: development_template
+assay_type: protein_activity_regression
+rationale: >-
+  Starting policy for protein-engineering pilots. A domain scientist must set
+  family definitions, synthesis constraints, controls, and meaningful effect size.
+evaluation:
+  min_test_rows: 30
+  min_num_clusters: 5
+  min_lift_delta: 0.0
+  min_uncertainty_spearman: 0.20
+  max_calibration_gap_ratio: 1.0
+  similarity_policy: canonical_kmer_jaccard
+  similarity_threshold: 0.80
+batch_design:
+  plate_size: 96
+  controls:
+    positive_control: 4
+    negative_control: 4
+    blank_control: 2
+  candidate_replicates: 2
+  family_column: sequence_family
+  max_per_family: 10
+  exclude_edge_wells: false
+statistics:
+  alpha: 0.05
+  target_power: 0.80
+  minimum_standardized_effect: 0.5

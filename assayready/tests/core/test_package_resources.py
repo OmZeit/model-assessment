@@ -14,6 +14,15 @@ EXPECTED_RESOURCES = [
     "examples/public_dream_promoter_candidates.csv",
     "examples/public_dream_promoter_predictions.csv",
     "examples/public_dream_promoter_source.md",
+    "examples/controlled_execution.json",
+    "policy_packs/promoter_regression_v1.yaml",
+    "policy_packs/protein_activity_v1.yaml",
+    "model_bundles/dnabert2_117m/Dockerfile",
+    "model_bundles/dnabert2_117m/runtime.py",
+    "model_bundles/dnabert2_117m/train_head.py",
+    "model_bundles/dnabert2_117m/predict.py",
+    "model_bundles/dnabert2_117m/requirements.lock.txt",
+    "model_bundles/dnabert2_117m/controlled_execution.json",
 ]
 
 

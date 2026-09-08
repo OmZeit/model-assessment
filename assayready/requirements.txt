@@ -1,17 +1,8 @@
-# Legacy pip-only CPU fallback. Prefer:
+# Lightweight pip install for spreadsheet auditing, reporting, and the local UI.
+# Run this file from the `assayready/` project directory. For local-model
+# training or tokenizer utilities, install the modeling extra instead:
 #
-#   pixi install --environment model-assessment
+#   python -m pip install ".[modeling]"
 #
-# Security comes from using a lockfile, auditing, and tests; this file only
-# gives manual pip users the same bounded runtime dependency policy.
--e .
-dash>=4.2,<5
-torch>=2.12,<2.13
-numpy>=2.4,<2.6
-pandas>=3.0,<3.1
-plotly>=6.0,<7
-openpyxl>=3.1,<3.2
-scikit-learn>=1.9,<2
-PyYAML>=6.0,<7
-rapidfuzz>=3.14,<4
-tokenizers>=0.22,<0.24
+# The project metadata owns the bounded runtime dependency policy.
+.

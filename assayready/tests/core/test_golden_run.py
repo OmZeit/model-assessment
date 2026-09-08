@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,7 +11,11 @@ def test_golden_run_exploratory(tmp_path: Path) -> None:
     assay_csv = project_root / "examples" / "public_dream_promoter_predictions.csv"
     
     # 2. Run the CLI in "run" (exploratory) mode
-    env = {"PYTHONPATH": str(project_root.parent)}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(project_root.parent),
+        "ASSAYREADY_RUN_DB": str(tmp_path / "runs.sqlite"),
+    }
     cmd = [
         sys.executable,
         "-m",
@@ -47,6 +52,9 @@ def test_golden_run_exploratory(tmp_path: Path) -> None:
         "benchmark_report.md",
         "readiness_report.md",
         "model_card.md",
+        "candidate_prioritization.csv",
+        "baseline_predictions.csv",
+        "similarity_sensitivity.json",
     ]
     for expected in expected_files:
         assert (output_dir / expected).exists(), f"Missing artifact: {expected}. Actual files: {actual_files}"
@@ -57,6 +65,8 @@ def test_golden_run_exploratory(tmp_path: Path) -> None:
     assert run_data["project"] == "test_exploratory_run"
     assert "benchmark_report" in run_data
     assert "artifact_dir" in run_data
+    assert run_data["benchmark_report"]["assurance_level"]["key"] == "controlled_evaluation"
+    assert "Recommended" not in run_data["benchmark_report"]["verdict"]
     
     with (output_dir / "execution_manifest.json").open() as f:
         manifest_data = json.load(f)

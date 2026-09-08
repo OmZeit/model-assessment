@@ -27,6 +27,11 @@ outputs/
 pytest_tmp_*/
 *.sqlite
 *.sqlite-journal
+local_models/
+model_bundles_local/
+datasets/
+.tmp/
+*.patch
 
 # Editors and operating systems
 .vscode/
