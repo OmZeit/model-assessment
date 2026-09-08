@@ -27,7 +27,7 @@ platforms = ["win-64", "linux-64"]
 [feature.dev.dependencies]
 python-build = ">=1.3,<2"
 pytest = ">=9.0.3,<10"
-transformers = ">=4.50,<5"
+transformers = ">=4.50,<6"
 
 [feature.dev.pypi-dependencies]
 pip-audit = ">=2.9,<3"

@@ -7144,7 +7144,7 @@ def create_app() -> Dash:
         requirements = [
             "einops>=0.8,<1", "huggingface-hub>=0.23,<2", "peft>=0.15,<1",
             "safetensors>=0.4,<1", "tokenizers>=0.22,<0.24", "torch>=2.12,<2.13",
-            "transformers>=4.50,<5",
+            "transformers>=4.50,<6",
         ]
         try:
             completed = subprocess.run(
